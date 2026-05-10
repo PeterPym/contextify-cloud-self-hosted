@@ -1,0 +1,251 @@
+"""Application configuration via environment variables."""
+
+from urllib.parse import urlsplit
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings
+
+DEFAULT_API_SECRET_KEY = "dev-secret-change-me"
+DEFAULT_EMAIL_FROM = "noreply@contextify.sh"
+MIN_SUPPORT_ADMIN_TOKEN_LENGTH = 32
+
+
+def is_dev_email_url(value: str) -> bool:
+    """Return True for local/test URLs where fake email delivery is safe."""
+    try:
+        host = urlsplit(value.strip()).hostname
+    except ValueError:
+        host = None
+    if not host:
+        return False
+    host = host.rstrip(".").lower()
+    return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".test")
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    # Database
+    database_url: str = (
+        "postgresql+asyncpg://contextify:contextify@localhost:5432/contextify"
+    )
+
+    # API security
+    api_secret_key: str = DEFAULT_API_SECRET_KEY
+
+    # Stripe (optional for self-hosted)
+    stripe_secret_key: str = ""
+    stripe_publishable_key: str = ""
+    stripe_webhook_secret: str = ""
+
+    # SMTP (optional - invitations logged if not configured)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "noreply@contextify.sh"
+
+    # Transactional auth email. When RESEND_API_KEY is empty, auth emails are
+    # logged instead of sent so local/dev/CI workflows remain fully testable.
+    resend_api_key: str = ""
+    dev_allow_fake_transactional_email: bool = False
+    email_from: str = DEFAULT_EMAIL_FROM
+    email_reply_to: str = "support@contextify.sh"
+    email_base_url: str = ""
+    auth_email_delivery_max_attempts: int = 3
+    auth_email_retry_delay_seconds: int = 300
+    auth_email_outbox_interval_seconds: int = 60
+    tos_version: str = "2026-04-24"
+
+    # Invitation settings
+    invitation_base_url: str = ""
+    invitation_expiry_days: int = 7
+
+    # Deployment mode
+    cloud_profile: str = ""
+    self_hosted: bool = False
+    commercial_license_key: str = ""
+    enable_docs: bool = False  # Set True locally to enable /api/docs, /api/redoc, /openapi.json
+    enable_registration: bool = False  # Public self-serve registration is off by default
+
+    # JWT session auth (dashboard cookies)
+    jwt_token_expire_hours: int = 24
+    reauth_window_minutes: int = 15
+    auth_email_resend_cooldown_seconds: int = 180
+    # Production deployments must set this to True so session and CSRF cookies
+    # are always emitted with Secure=True regardless of the request scheme
+    # the ASGI app sees from upstream proxies. The request-scheme inference
+    # in _is_secure_request only applies when this flag is False (dev/CI).
+    force_secure_cookies: bool = False
+    # Launch behavior: one browser session maps to one active tenant membership.
+    # Keep disabled until explicit tenant switching exists.
+    allow_multi_membership_accounts: bool = False
+
+    # CORS
+    allowed_origins: str = "http://localhost:3000"
+    # Comma-separated CIDRs whose X-Forwarded-Proto header is trusted. Loopback
+    # clients are always trusted. Self-hosted compose sets Docker/OrbStack
+    # gateway ranges for host-level Caddy -> container traffic.
+    trusted_proxy_cidrs: str = ""
+
+    # Logging
+    log_level: str = "info"
+    log_format: str = "text"  # "json" for structured output, "text" for plaintext
+
+    # Error monitoring
+    error_monitoring_enabled: bool = False
+    error_monitoring_send_default_pii: bool = False
+    error_monitoring_max_events_per_minute: int = 20
+    ops_smoke_token: str = ""
+    support_admin_token: str = ""
+    sentry_dsn: str = ""
+    sentry_environment: str = "production"
+    sentry_release: str = ""
+    sentry_error_sample_rate: float = 1.0
+    sentry_traces_sample_rate: float | None = None
+    sentry_profiles_sample_rate: float | None = None
+    sentry_debug: bool = False
+
+    # Sync limits
+    max_batch_size: int = 5000
+    max_entry_content_bytes: int = 1_000_000  # 1MB per entry content field
+    max_request_body_bytes: int = 50_000_000  # 50MB overall request body limit
+    idempotency_ttl_hours: int = 24  # How long idempotency keys are retained
+    session_ttl_hours: int = 24  # How long before inactive sync sessions are marked abandoned
+
+    # Rate limiting (per API key, requests per minute; 0 = disabled)
+    rate_limit_sync_per_minute: int = 120
+    rate_limit_search_per_minute: int = 60
+    rate_limit_auth_per_minute: int = 10
+
+    # Unauthenticated endpoint rate limits (per IP, requests per minute; 0 = disabled)
+    rate_limit_unauth_register_per_minute: int = 5
+    rate_limit_unauth_login_per_minute: int = 10
+    rate_limit_unauth_device_code_per_minute: int = 10
+    rate_limit_unauth_device_token_per_minute: int = 30
+    rate_limit_unauth_invitation_accept_per_minute: int = 10
+    rate_limit_unauth_email_init_per_minute: int = 10
+    rate_limit_unauth_verify_otp_per_minute: int = 10
+    # ct-1563 — sister rate limits for the no-device /cloud/login magic-link
+    # flow (spec §13b). Same per-IP cap as the device-flow endpoints; the
+    # per-token OTP lockout is enforced inside ``verify_device_otp_attempt``.
+    rate_limit_unauth_login_email_link_per_minute: int = 10
+    rate_limit_unauth_login_verify_otp_per_minute: int = 10
+
+    # Magic-link / OTP device flow (cloud-magic-link spec §5.3, §10).
+    # AuthToken expiry for device-flow magic-link / OTP tokens is 10 minutes.
+    auth_device_token_expiry_seconds: int = 600
+    # Per-token OTP brute-force defense: how many wrong codes before a token
+    # is invalidated (consumed_at set with the locked sentinel). Spec §10.
+    auth_otp_attempts_per_token_max: int = 5
+    # Per-device-code send cap: prevents email-bombing a single CLI session.
+    # Counts non-consumed AuthTokens with the device_authorization_id metadata
+    # plus any tokens already invalidated by resend semantics. Spec §10.
+    auth_email_send_cap_per_device_code: int = 5
+
+    # Device flow (RFC 8628)
+    device_code_expiry_seconds: int = 900  # 15 minutes
+    device_poll_interval: int = 5  # Minimum seconds between polls
+
+    # Browser handoff lets native clients exchange a valid API key for a
+    # short-lived one-time browser URL. Self-hosted operators can disable it.
+    enable_browser_handoff: bool = True
+    browser_handoff_token_ttl_seconds: int = 60
+
+    # Data retention (days, 0 = no auto-deletion)
+    default_data_retention_days: int = 0
+
+    # Purge scheduling
+    purge_grace_period_days: int = 30  # Days between deletion trigger and actual purge
+    purge_check_interval_seconds: int = 3600  # 1 hour between purge sweeps
+    purge_tombstone_retention_months: int = 12  # Months to retain tombstone records
+    purge_batch_limit: int = 5  # Max tenants to purge per sweep
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_removed_legacy_smoke_token(cls, data: object) -> object:
+        """Tolerate stale dotenv files that still contain the retired alias."""
+        if isinstance(data, dict):
+            data.pop("error_monitoring_smoke_test_token", None)
+            data.pop("ERROR_MONITORING_SMOKE_TEST_TOKEN", None)
+        return data
+
+    @field_validator("sentry_traces_sample_rate", "sentry_profiles_sample_rate", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
+
+    @field_validator("purge_grace_period_days")
+    @classmethod
+    def validate_non_negative_purge_grace_period(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("purge_grace_period_days must be >= 0")
+        return value
+
+    @field_validator(
+        "purge_check_interval_seconds",
+        "purge_tombstone_retention_months",
+        "purge_batch_limit",
+        "auth_email_delivery_max_attempts",
+        "auth_email_retry_delay_seconds",
+        "auth_email_outbox_interval_seconds",
+    )
+    @classmethod
+    def validate_positive_integer_settings(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("integer settings must be >= 1")
+        return value
+
+    @field_validator(
+        "rate_limit_sync_per_minute",
+        "rate_limit_search_per_minute",
+        "rate_limit_auth_per_minute",
+        "rate_limit_unauth_register_per_minute",
+        "rate_limit_unauth_login_per_minute",
+        "rate_limit_unauth_device_code_per_minute",
+        "rate_limit_unauth_device_token_per_minute",
+        "rate_limit_unauth_invitation_accept_per_minute",
+        "rate_limit_unauth_email_init_per_minute",
+        "rate_limit_unauth_verify_otp_per_minute",
+        "rate_limit_unauth_login_email_link_per_minute",
+        "rate_limit_unauth_login_verify_otp_per_minute",
+    )
+    @classmethod
+    def validate_non_negative_rate_limits(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("rate limits must be >= 0")
+        return value
+
+    @field_validator(
+        "auth_device_token_expiry_seconds",
+        "auth_otp_attempts_per_token_max",
+        "auth_email_send_cap_per_device_code",
+        "browser_handoff_token_ttl_seconds",
+    )
+    @classmethod
+    def validate_positive_device_flow_settings(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("device-flow integer settings must be >= 1")
+        return value
+
+    @field_validator(
+        "sentry_error_sample_rate",
+        "sentry_traces_sample_rate",
+        "sentry_profiles_sample_rate",
+    )
+    @classmethod
+    def validate_sample_rate(cls, value: float | None) -> float | None:
+        if value is None or 0.0 <= value <= 1.0:
+            return value
+        raise ValueError("sample rate must be between 0 and 1")
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.allowed_origins.split(",")]
+
+
+settings = Settings()

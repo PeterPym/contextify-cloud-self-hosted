@@ -1,0 +1,30 @@
+{# Individual search result items. Used for both full page render
+   and htmx partial responses. #}
+{% for item in items %}
+<div class="ctxf-search-result">
+  <div class="d-flex align-items-start gap-2">
+    <div class="ctxf-search-meta flex-grow-1">
+      <div class="d-flex align-items-center gap-2 mb-1 flex-wrap">
+        <span class="fw-semibold text-sm">{{ item.user_name or item.user_email or "Unknown user" }}</span>
+        <span class="text-secondary text-sm">in</span>
+        <span class="fw-medium text-sm">{{ item.project_name or item.project_id }}</span>
+        {% if item.kind == "user" %}
+        <span class="badge text-bg-primary ctxf-kind-badge">user</span>
+        {% elif item.kind == "assistant" %}
+        <span class="badge text-bg-success ctxf-kind-badge">assistant</span>
+        {% elif item.kind == "system" %}
+        <span class="badge text-bg-warning ctxf-kind-badge">system</span>
+        {% elif item.kind == "summary" %}
+        <span class="badge text-bg-info ctxf-kind-badge">summary</span>
+        {% else %}
+        <span class="badge text-bg-secondary ctxf-kind-badge">{{ item.kind }}</span>
+        {% endif %}
+      </div>
+      <p class="ctxf-search-snippet mb-1">{{ item.snippet | safe }}</p>
+      <small class="text-secondary" data-timestamp="{{ item.timestamp }}">
+        {{ item.timestamp | relative_time }}
+      </small>
+    </div>
+  </div>
+</div>
+{% endfor %}

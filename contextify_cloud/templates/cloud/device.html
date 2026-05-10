@@ -1,0 +1,389 @@
+{% extends "base.html" %}
+{% set hide_sidebar = true %}
+{% set active_page = 'sync' %}
+
+{% block title %}Connect Contextify on your Mac - Contextify Cloud{% endblock %}
+
+{# ─────────────────────────────────────────────────────────────────────────
+   ct-1512 / ct-1565 — /cloud/device redesign
+
+   This template renders five visual states per spec §6:
+
+     State A   — no session, ?user_code=XXXX in URL: setup-code pill +
+                 email input + "Send sign-in link" button.
+     State A'  — no session, no ?user_code: manual setup-code input
+                 + email input + "Send sign-in link" button.
+     State B   — email submitted; "Check your email" + spinner + OTP
+                 fallback (secondary disclosure under the magic-link CTA).
+     State C   — signed in with recent reauth: existing user_code entry
+                 form. The atomic-authorize POST handler in
+                 routers/dashboard.py owns this happy path (ct-1515 / ct-1567).
+                 Branch preserved here unchanged for backward compatibility.
+     State D   — signed in but stale reauth: read-only email + "Send
+                 sign-in link" button (replaces the legacy red banner).
+     State E   — error states: magic-link expired / consumed / superseded
+                 (rendered via magic_link_state == "error") plus inline
+                 error rendering for State C's POST failures.
+
+   Branching uses the context keys provided by the router:
+
+     magic_link_state    one of None / "interstitial" / "error"
+     magic_link_token    raw token (interstitial only)
+     magic_link_error_code   "token_unknown" / "token_expired" /
+                             "token_consumed" / "superseded"
+     confirm_action      POST URL for the interstitial form
+     public_csrf_token   CSRF token cookie value
+     auth                AuthContext (None for the interstitial path)
+     success / error     existing State C POST result strings
+     user_code           query-string user_code (for State A pill prefill)
+
+   States A / A' / B / D are JS-driven via /cloud/static/js/device-flow.js
+   (vanilla, no external deps). State C and the success card are server-
+   rendered only — they belong to the existing dashboard.py POST handler
+   and must not be regressed.
+   ──────────────────────────────────────────────────────────────────────── #}
+
+{% block content_nosidebar %}
+<div class="ctxf-auth-container">
+  <div class="ctxf-auth-card card">
+    <div class="card-body">
+
+      {# ── State C/E: post-success "Connected" card (atomic-authorize) ── #}
+      {% if success %}
+      <div class="text-center mb-4">
+        <i class="bi bi-check-circle-fill ctxf-auth-icon text-success"
+           aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Connected</h2>
+      </div>
+      <div class="alert alert-success" role="alert">
+        <h6 class="alert-heading">
+          <i class="bi bi-check-circle-fill me-1" aria-hidden="true"></i>{{ success }}
+        </h6>
+        <p class="mb-0">
+          Your Contextify app is now connected to your Cloud account. You can
+          close this tab.
+        </p>
+      </div>
+
+      {# ── State C interstitial: signed-in user clicked the magic link ── #}
+      {% elif magic_link_state == "interstitial" %}
+      <div class="text-center mb-4">
+        <i class="bi bi-envelope-check ctxf-auth-icon" aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Finish connecting Contextify</h2>
+        <p class="text-secondary mb-0">
+          You're about to finish connecting Contextify on your Mac. Click
+          below to complete sign-in.
+        </p>
+      </div>
+      {# Explicit-action form: NO auto-submit JS. Defends against email-
+         scanner pre-fetch (spec §10) — pre-fetchers follow the GET URL but
+         do not submit the form, so the actual token consumption only
+         happens on POST. #}
+      <form method="post" action="{{ confirm_action }}" id="ctxf-device-confirm-form">
+        <input type="hidden" name="csrf_token" value="{{ public_csrf_token }}">
+        <input type="hidden" name="token" value="{{ magic_link_token }}">
+        <button type="submit" class="btn ctxf-btn-primary w-100 mb-3"
+                aria-label="Connect Contextify">
+          Connect Contextify
+        </button>
+      </form>
+      <div class="text-center">
+        <a href="/cloud/login">Cancel</a>
+      </div>
+
+      {# ── State E: magic-link error states ─────────────────────────────── #}
+      {% elif magic_link_state == "error" %}
+      <div class="text-center mb-4">
+        <i class="bi bi-exclamation-triangle-fill ctxf-auth-icon text-warning"
+           aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Sign-in link not valid</h2>
+      </div>
+      <div class="alert alert-warning d-flex align-items-start" role="alert">
+        <i class="bi bi-exclamation-triangle-fill me-2 mt-1"
+           aria-hidden="true"></i>
+        <div>
+          {% if magic_link_error_code == "token_expired" %}
+            This sign-in link has expired. Open Contextify on your Mac and
+            request a new sign-in link.
+          {% elif magic_link_error_code == "token_consumed" %}
+            This link has already been used. If you didn't sign in, open
+            Contextify on your Mac and request a new sign-in link.
+          {% elif magic_link_error_code == "superseded" %}
+            This email was replaced by a newer sign-in email. Use the
+            latest email from Contextify.
+          {% else %}
+            This sign-in link is not valid. Open Contextify on your Mac and
+            request a new sign-in link.
+          {% endif %}
+        </div>
+      </div>
+      <div class="text-center">
+        <a href="/cloud/login" class="btn ctxf-btn-secondary w-100">
+          Back to sign in
+        </a>
+      </div>
+
+      {# ── State D: signed-in but stale reauth ──────────────────────────── #}
+      {% elif device_state == "stale_reauth" and auth %}
+      <div class="text-center mb-4">
+        <i class="bi bi-shield-lock-fill ctxf-auth-icon" aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Connect Contextify on your Mac</h2>
+        <p class="text-secondary mb-0">
+          We need to confirm it's still you. We'll email a sign-in link to
+          {{ session_email or 'your account email' }}.
+        </p>
+      </div>
+
+      {% if user_code %}
+      <div class="ctxf-device-pill mb-3 p-3 rounded border text-center"
+           role="group" aria-label="Setup code">
+        <div class="small text-secondary mb-1">Setup code</div>
+        <div class="d-flex align-items-center justify-content-center gap-2">
+          <code class="ctxf-device-pill-code font-monospace fs-4"
+                id="ctxf-device-setup-code"
+                style="letter-spacing: 0.15em;">{{ user_code }}</code>
+          <button type="button"
+                  class="btn btn-sm btn-outline-secondary ctxf-copy-setup-code"
+                  data-copy-target="ctxf-device-setup-code"
+                  aria-label="Copy setup code">
+            <i class="bi bi-clipboard" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+      {% endif %}
+
+      {# ct-1512 audit P1-3: explicit method=post + action so a JS bind
+         failure does not default-submit as GET (which would put `email`
+         and `setup_code` into the URL query string). The JS submit
+         interceptor fail-closes (preventDefault) when DOM is malformed,
+         and method=post here is the belt-and-braces second line. #}
+      <form id="ctxf-device-init-form" method="post"
+            action="/api/v1/auth/device/email-init" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ public_csrf_token }}">
+        <input type="hidden" name="device_code" value="{{ device_code or '' }}">
+        {% if user_code %}
+        <input type="hidden" name="user_code" value="{{ user_code }}">
+        {% else %}
+        <div class="mb-3">
+          <label for="ctxf-device-setup-code-input" class="form-label">
+            Setup code
+          </label>
+          <input type="text"
+                 class="form-control font-monospace text-center"
+                 id="ctxf-device-setup-code-input"
+                 name="setup_code"
+                 placeholder="XXXX-XXXX" required
+                 maxlength="9"
+                 pattern="[A-Z0-9]{4}-[A-Z0-9]{4}"
+                 autocomplete="off"
+                 autocapitalize="characters"
+                 style="letter-spacing: 0.15em;">
+          <div class="form-text">
+            Look for the 8-character code in the Contextify app on your Mac.
+          </div>
+        </div>
+        {% endif %}
+        <div class="mb-3">
+          <label for="ctxf-device-email" class="form-label">Email address</label>
+          <input type="email" class="form-control" id="ctxf-device-email"
+                 name="email" autocomplete="email" required readonly
+                 value="{{ session_email or '' }}"
+                 aria-describedby="ctxf-device-email-help">
+          <div id="ctxf-device-email-help" class="form-text">
+            Locked to your signed-in account.
+          </div>
+        </div>
+        <button type="submit" class="btn ctxf-btn-primary w-100 mb-2"
+                id="ctxf-device-submit">
+          Send sign-in link
+        </button>
+        <div class="invalid-feedback d-block small text-danger d-none"
+             id="ctxf-device-init-error" aria-live="polite"></div>
+      </form>
+
+      {# ── State B (await/OTP): shared with State A/A'; toggled by JS ──── #}
+      {% include "cloud/_device_await.html" %}
+
+      <div class="text-center mt-2">
+        <a href="/cloud/login?return_to={{ ('/cloud/device?user_code=' ~ user_code) if user_code else '/cloud/device' }}">
+          Or sign in with password
+        </a>
+      </div>
+      <div class="text-center mt-2">
+        <form method="post" action="/cloud/logout"
+              id="ctxf-device-logout-form" class="d-inline">
+          <input type="hidden" name="csrf_token"
+                 value="{{ public_csrf_token }}">
+          <input type="hidden" name="return_to"
+                 value="{{ ('/cloud/device?user_code=' ~ user_code) if user_code else '/cloud/device' }}">
+          <button type="submit"
+                  class="btn btn-link p-0 small text-secondary">
+            Sign out and use a different account
+          </button>
+        </form>
+      </div>
+
+      {# ── State C: signed-in user_code form (existing happy path) ──────── #}
+      {% elif auth %}
+      <div class="text-center mb-4">
+        <i class="bi bi-laptop ctxf-auth-icon" aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Authorize Device</h2>
+        <p class="text-secondary">
+          Enter the code shown in your terminal to connect your device.
+        </p>
+      </div>
+
+      {% if error %}
+      <div class="alert alert-danger d-flex align-items-center" role="alert">
+        <i class="bi bi-exclamation-triangle-fill me-2"
+           aria-hidden="true"></i>
+        <div>{{ error }}</div>
+      </div>
+      {% endif %}
+
+      {# State C atomic-authorize POST is owned by routers/dashboard.py
+         (device_verify, ct-1515 / ct-1567). DO NOT re-implement here:
+         the form below posts the user_code to /cloud/device which calls
+         _finalize_device_authorization atomically. #}
+      <form method="post" action="/cloud/device" id="ctxf-device-c-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="mb-3">
+          <label for="user_code" class="form-label">Device Code</label>
+          <input type="text" class="form-control text-center font-monospace fs-4"
+                 id="user_code" name="user_code"
+                 placeholder="XXXX-XXXX" required
+                 maxlength="9" minlength="9"
+                 autocomplete="off" autocapitalize="characters"
+                 style="letter-spacing: 0.15em;"
+                 value="{{ user_code or '' }}">
+          <div class="form-text">
+            The code is displayed in your terminal after running
+            <code>contextify cloud setup</code>.
+          </div>
+        </div>
+        <button type="submit" class="btn ctxf-btn-primary w-100 mb-3">
+          Verify Code
+        </button>
+      </form>
+
+      {# ── State A / A': no session paths ───────────────────────────────── #}
+      {% else %}
+      <div class="text-center mb-4">
+        <i class="bi bi-laptop ctxf-auth-icon" aria-hidden="true"></i>
+        <h2 class="ctxf-auth-title">Connect Contextify on your Mac</h2>
+        <p class="text-secondary mb-0">
+          Sync your AI coding history and search it from any Mac.
+        </p>
+      </div>
+
+      {% if hosted_switch_context and not auth %}
+      <div class="alert alert-info small mb-3" role="status">
+        <strong>Switching from self-hosted?</strong>
+        Use the email you want for Contextify Cloud. It does not need to
+        match the email on your self-hosted server. If needed, Contextify
+        Cloud will create an account and workspace after email verification.
+        After this Mac connects, it can sync local Contextify history to
+        Contextify Cloud. This does not import your self-hosted account,
+        workspace, server settings, API keys, or remote server data.
+      </div>
+      {% endif %}
+
+      {% if user_code %}
+      {# State A: setup-code pill (anchors the user — same code in their app
+         modal). #}
+      <div class="ctxf-device-pill mb-3 p-3 rounded border text-center"
+           role="group" aria-label="Setup code">
+        <div class="small text-secondary mb-1">Setup code</div>
+        <div class="d-flex align-items-center justify-content-center gap-2">
+          <code class="ctxf-device-pill-code font-monospace fs-4"
+                id="ctxf-device-setup-code"
+                style="letter-spacing: 0.15em;">{{ user_code }}</code>
+          <button type="button"
+                  class="btn btn-sm btn-outline-secondary ctxf-copy-setup-code"
+                  data-copy-target="ctxf-device-setup-code"
+                  aria-label="Copy setup code">
+            <i class="bi bi-clipboard" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+      <p class="text-secondary small mb-3">
+        Enter your email and we'll send a secure sign-in link to finish
+        setup.
+      </p>
+      {% else %}
+      {# State A': manual setup-code input. #}
+      <p class="text-secondary small mb-3">
+        Enter the setup code shown in the Contextify app.
+      </p>
+      {% endif %}
+
+      {# ct-1512 audit P1-3: explicit method=post + action so a JS bind
+         failure does not default-submit as GET (which would put `email`
+         and `setup_code` into the URL query string). #}
+      <form id="ctxf-device-init-form" method="post"
+            action="/api/v1/auth/device/email-init" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ public_csrf_token }}">
+        <input type="hidden" name="device_code" value="{{ device_code or '' }}">
+        {% if user_code %}
+        <input type="hidden" name="user_code" value="{{ user_code }}">
+        {% else %}
+        <div class="mb-3">
+          <label for="ctxf-device-setup-code-input" class="form-label">
+            Setup code
+          </label>
+          <input type="text"
+                 class="form-control font-monospace text-center"
+                 id="ctxf-device-setup-code-input"
+                 name="setup_code"
+                 placeholder="XXXX-XXXX" required
+                 maxlength="9"
+                 pattern="[A-Z0-9]{4}-[A-Z0-9]{4}"
+                 autocomplete="off"
+                 autocapitalize="characters"
+                 style="letter-spacing: 0.15em;">
+          <div class="form-text">
+            Look for the 8-character code in the Contextify app on your Mac.
+          </div>
+        </div>
+        {% endif %}
+        <div class="mb-3">
+          <label for="ctxf-device-email" class="form-label">Email address</label>
+          <input type="email" class="form-control" id="ctxf-device-email"
+                 name="email" placeholder="you@example.com" required
+                 autocomplete="email"
+                 value="{{ email_hint or '' }}">
+        </div>
+        <button type="submit" class="btn ctxf-btn-primary w-100 mb-2"
+                id="ctxf-device-submit">
+          Send sign-in link
+        </button>
+        <div class="form-text text-secondary text-center mb-2">
+          No password needed.
+        </div>
+        <div class="invalid-feedback d-block small text-danger d-none"
+             id="ctxf-device-init-error" aria-live="polite"></div>
+      </form>
+
+      {# ── State B (await/OTP): shared with State D; toggled by JS ─────── #}
+      {% include "cloud/_device_await.html" %}
+
+      <div class="text-center mt-3">
+        <a href="/cloud/login?return_to={{ ('/cloud/device?user_code=' ~ user_code) if user_code else '/cloud/device' }}">
+          Already have a password? Sign in
+        </a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts_extra %}
+{# device-code.js handles the legacy State C user_code input formatting. #}
+<script src="/cloud/static/js/device-code.js" nonce="{{ csp_nonce }}"></script>
+{# device-flow.js drives State A/A' → B → success transitions. Loaded on
+   every render so the State A/A' form (when present) wires up; on State C
+   / interstitial / error renders the script no-ops because the expected
+   element IDs are not in the DOM. #}
+<script src="/cloud/static/js/device-flow.js" nonce="{{ csp_nonce }}"></script>
+{% endblock %}

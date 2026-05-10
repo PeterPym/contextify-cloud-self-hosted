@@ -1,0 +1,13 @@
+Click the button below to sign in to Contextify Cloud:
+
+  {{ magic_link_url }}
+
+Or enter this 6-digit code on the sign-in page:
+
+  {{ otp_code }}
+
+This link and code expire in {{ expires_in_minutes }} minutes.
+
+If you didn't request this, you can safely ignore this email.
+
+— Contextify

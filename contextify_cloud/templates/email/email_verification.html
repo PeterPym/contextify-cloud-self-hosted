@@ -1,0 +1,26 @@
+{% extends "email/base.html" %}
+{% block subject %}Verify your Contextify Cloud email{% endblock %}
+{% block preheader %}Confirm your email to finish setting up Contextify Cloud.{% endblock %}
+{% block content %}
+<h1 style="margin:0 0 12px 0;font-size:22px;line-height:30px;font-weight:600;color:#1E293B;letter-spacing:-0.2px;">Verify your email.</h1>
+<p style="margin:0 0 20px 0;font-size:15px;line-height:22px;color:#334155;">Confirm this is your email address to finish setting up your Contextify Cloud account.</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:8px 0 4px 0;">
+  <tr>
+    <td style="border-radius:8px;background:#4A7BA7;">
+      <a href="{{ verify_url }}" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;line-height:20px;">Verify email address</a>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:20px 0 6px 0;font-size:13px;line-height:20px;color:#64748B;">Trouble with the button? Paste this URL into your browser:</p>
+<p style="margin:0 0 8px 0;font-size:13px;line-height:20px;color:#475569;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;">{{ verify_url }}</p>
+
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#F1F5F9;border:1px solid #CBD5E1;border-radius:8px;margin-top:20px;">
+  <tr>
+    <td style="padding:14px 16px;font-size:13px;line-height:20px;color:#475569;">
+      <strong style="color:#1E293B;">Did not create an account?</strong> If you did not create a Contextify Cloud account, ignore this email.
+    </td>
+  </tr>
+</table>
+{% endblock %}

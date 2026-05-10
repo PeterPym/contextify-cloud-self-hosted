@@ -1,0 +1,21 @@
+Welcome to Contextify Cloud{% if display_name %}, {{ display_name }}{% endif %}.
+
+Your account is ready. Sign in once on this {{ device }}, and your Claude Code
+and Codex history stays in sync across every Mac and Linux machine you use
+Contextify on.
+
+{{ cta }}:
+
+  {{ connect_url }}
+
+What you just unlocked:
+  - Sync across all your Macs and Linux machines
+  - Full conversation history retained
+  - Search every session you have ever had
+
+Adding another Mac or Linux machine? Open Contextify on it, choose
+Settings > Cloud, then connect it. Your history will catch up automatically.
+
+Need help? Reply to this email or visit https://contextify.sh/help.
+
+— Contextify

@@ -1,0 +1,10 @@
+Verify your Contextify Cloud email.
+
+Confirm this is your email address to finish setting up your Contextify Cloud
+account:
+
+  {{ verify_url }}
+
+If you did not create a Contextify Cloud account, ignore this email.
+
+— Contextify

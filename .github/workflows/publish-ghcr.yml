@@ -1,0 +1,156 @@
+name: Publish GHCR Image
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to build, e.g. v1.7.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-ghcr-${{ github.ref_name }}-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve image metadata
+        id: image
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            release_tag="${RELEASE_TAG_INPUT}"
+          else
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?$'
+          if ! [[ "$release_tag" =~ $tag_re ]]; then
+            echo "Invalid release tag for GHCR publishing: $release_tag" >&2
+            exit 1
+          fi
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "version=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$release_tag" >> "$GITHUB_OUTPUT"
+          echo "package=contextify-cloud-personal" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/contextify-cloud-personal" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ steps.image.outputs.ref }}
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            -t "${{ steps.image.outputs.image }}:${{ steps.image.outputs.version }}" \
+            .
+
+      - name: Inspect image contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i --entrypoint python \
+            "${{ steps.image.outputs.image }}:${{ steps.image.outputs.version }}" \
+            - <<'PY'
+          import base64
+          import importlib.util
+          import json
+          from pathlib import Path
+          
+          root = Path("/app")
+          forbidden_paths = json.loads(base64.b64decode("WyJjb250ZXh0aWZ5X2Nsb3VkL2hvc3RlZCIsICJjb250ZXh0aWZ5X2Nsb3VkL3JvdXRlcnMvYmlsbGluZy5weSIsICJjb250ZXh0aWZ5X2Nsb3VkL3JvdXRlcnMvaW50ZXJuYWxfZ3Jvd3RoLnB5IiwgImNvbnRleHRpZnlfY2xvdWQvcm91dGVycy9pbnRlcm5hbF9zdXBwb3J0LnB5IiwgImNvbnRleHRpZnlfY2xvdWQvc2VydmljZXMvc3RyaXBlX2dhdGV3YXkucHkiLCAic2NyaXB0cy9zdHJpcGVfc2V0dXAucHkiLCAidXYubG9jayJd"))
+          forbidden_text = json.loads(base64.b64decode("WyJTVFJJUEVfIiwgIkNPTU1FUkNJQUxfTElDRU5TRV9LRVkiLCAiQ0xPVURfUFJPRklMRT1zZWxmX2hvc3RlZF9jb21tZXJjaWFsIiwgImNvbnRleHRpZnlfY2xvdWQuc2VydmljZXMuc3RyaXBlX2dhdGV3YXkiLCAiY29udGV4dGlmeV9jbG91ZC5ob3N0ZWQub3BzX3JvdXRlcyIsICIvY2xvdWQvYW5hbHl0aWNzIiwgIi9jbG91ZC90ZWFtIiwgIi9jbG91ZC9iaWxsaW5nIiwgIi9jbG91ZC9hZG1pbiJd"))
+          
+          for relative in forbidden_paths:
+              if (root / relative).exists():
+                  raise SystemExit(f"forbidden path present: {relative}")
+          
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              relative = path.relative_to(root).as_posix()
+              for token in forbidden_text:
+                  if token in text:
+                      raise SystemExit(f"forbidden text {token!r} present in {relative}")
+          
+          for name in ['cryptography', 'stripe']:
+              if importlib.util.find_spec(name) is not None:
+                  raise SystemExit(f"forbidden dependency importable: {name}")
+          
+          for name in []:
+              if importlib.util.find_spec(name) is None:
+                  raise SystemExit(f"required dependency missing: {name}")
+          
+          from contextify_cloud.app_factory import create_app
+          from contextify_cloud.profiles import CloudProfile
+          
+          create_app(getattr(CloudProfile, "SELF_HOSTED_PERSONAL"))
+          PY
+
+      - name: Login to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.image.outputs.image }}:${{ steps.image.outputs.version }}"
+
+      - name: Make GHCR package public
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_type="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .owner.type)"
+          package="${{ steps.image.outputs.package }}"
+          if [ "$owner_type" = "Organization" ]; then
+            owner_base="/orgs/${GITHUB_REPOSITORY_OWNER}"
+          else
+            owner_base="/users/${GITHUB_REPOSITORY_OWNER}"
+          fi
+          visibility_path="${owner_base}/packages/container/${package}/visibility"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh api --method PATCH "$visibility_path" -f visibility=public >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Unable to make GHCR package public: $visibility_path"
+          exit 1
+
+      - name: Summarize image publish
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### GHCR image publish"
+            echo ""
+            echo "- Image: \`${{ steps.image.outputs.image || 'unresolved' }}\`"
+            echo "- Version: \`${{ steps.image.outputs.version || 'unresolved' }}\`"
+            echo "- Package: \`${{ steps.image.outputs.package || 'unresolved' }}\`"
+            echo "- Job status: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,33 @@
+{% extends "email/base.html" %}
+{% block subject %}Sign in to Contextify Cloud{% endblock %}
+{% block preheader %}Your Contextify sign-in code is {{ otp_code }}. Expires in {{ expires_in_minutes }} minutes.{% endblock %}
+{% block content %}
+<h1 style="margin:0 0 12px 0;font-size:22px;line-height:30px;font-weight:600;color:#1E293B;letter-spacing:-0.2px;">Sign in to Contextify Cloud</h1>
+<p style="margin:0 0 16px 0;font-size:15px;line-height:22px;color:#334155;">Click the button below to sign in to Contextify Cloud:</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:8px 0 16px 0;">
+  <tr>
+    <td style="border-radius:8px;background:#4A7BA7;">
+      <a href="{{ magic_link_url }}" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;line-height:20px;">Sign in to Contextify Cloud</a>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:16px 0 8px 0;font-size:14px;line-height:20px;color:#475569;">Or enter this 6-digit code on the sign-in page:</p>
+
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+  <tr>
+    <td align="center" style="padding:8px 0 4px 0;">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center">
+        <tr>
+          <td align="center" style="background:#E8F0F7;border:1px solid #CBD5E1;border-radius:10px;padding:16px 24px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:26px;line-height:1.2;font-weight:600;color:#1E293B;letter-spacing:4px;white-space:nowrap;">
+            {{ otp_code }}
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:16px 0 0 0;font-size:13px;line-height:20px;color:#94A3B8;">This link and code expire in {{ expires_in_minutes }} minutes.</p>
+{% endblock %}

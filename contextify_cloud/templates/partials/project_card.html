@@ -1,0 +1,33 @@
+{# Project card grid items. Used both in the full page render and
+   for potential htmx responses. Loops over 'cards' variable. #}
+{% for card in cards %}
+<div class="col">
+  <a href="/cloud/projects/group/{{ card.project_id }}" class="text-decoration-none">
+    <div class="card ctxf-card ctxf-project-card h-100">
+      <div class="card-body">
+        <div class="d-flex align-items-center gap-2 mb-2">
+          <i class="bi bi-folder-fill ctxf-project-icon"></i>
+          <h6 class="card-title mb-0 text-truncate">{{ card.project_name or card.project_id }}</h6>
+        </div>
+        <div class="d-flex align-items-center gap-3 mt-3">
+          <span class="ctxf-project-stat">
+            <i class="bi bi-chat-text me-1"></i>{{ card.entry_count }} entr{{ "y" if card.entry_count == 1 else "ies" }}
+          </span>
+          {% if card.worktree_count > 1 %}
+          <span class="ctxf-project-stat text-secondary">
+            <i class="bi bi-diagram-3 me-1"></i>{{ card.worktree_count }} worktrees
+          </span>
+          {% endif %}
+        </div>
+        {% if card.last_activity %}
+        <small class="text-secondary d-block mt-2" data-timestamp="{{ card.last_activity }}">
+          Last active {{ card.last_activity | relative_time }}
+        </small>
+        {% else %}
+        <small class="text-secondary d-block mt-2">No activity yet</small>
+        {% endif %}
+      </div>
+    </div>
+  </a>
+</div>
+{% endfor %}

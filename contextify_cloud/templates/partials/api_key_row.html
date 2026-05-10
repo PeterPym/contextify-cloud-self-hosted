@@ -1,0 +1,53 @@
+{% for key in keys %}
+<tr class="ctxf-api-key-row" id="key-row-{{ key.key_id }}">
+  <td>
+    <code class="ctxf-key-prefix">{{ key.key_prefix }}</code>
+    {% if raw_key and key.key_id == new_key_id %}
+    <div class="mt-2">
+      <div class="alert alert-warning ctxf-raw-key-alert py-2 px-3 mb-0">
+        <small class="fw-semibold d-block mb-1">Copy this key now. It will not be shown again.</small>
+        <code class="ctxf-raw-key user-select-all d-block text-break">{{ raw_key }}</code>
+      </div>
+    </div>
+    {% endif %}
+  </td>
+  <td>{{ key.name }}</td>
+  <td>
+    {% if key.status == "active" %}
+    <span class="badge text-bg-success ctxf-key-status-badge">Active</span>
+    {% elif key.status == "revoked" %}
+    <span class="badge text-bg-danger ctxf-key-status-badge">Revoked</span>
+    {% elif key.status == "expired" %}
+    <span class="badge text-bg-warning ctxf-key-status-badge">Expired</span>
+    {% endif %}
+  </td>
+  <td class="text-secondary text-sm">
+    {{ key.created_at.strftime('%Y-%m-%d') if key.created_at else '-' }}
+  </td>
+  <td class="text-secondary text-sm">
+    {{ key.last_used_at.strftime('%Y-%m-%d %H:%M') if key.last_used_at else 'Never' }}
+  </td>
+  <td>
+    {% if key.status == "active" %}
+    <button class="btn btn-outline-secondary btn-sm me-1"
+            hx-post="/cloud/settings/keys/{{ key.id }}/rotate"
+            hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+            hx-target="#key-row-{{ key.key_id }}"
+            hx-swap="outerHTML"
+            hx-confirm="Rotate this API key? The current key will stop working.">
+      Rotate
+    </button>
+    <button class="btn btn-outline-danger btn-sm"
+            hx-post="/cloud/settings/keys/{{ key.id }}/revoke"
+            hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+            hx-target="#key-row-{{ key.key_id }}"
+            hx-swap="outerHTML"
+            hx-confirm="Revoke this API key? This cannot be undone.">
+      Revoke
+    </button>
+    {% else %}
+    <span class="text-secondary text-sm">-</span>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}

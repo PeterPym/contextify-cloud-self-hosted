@@ -1,0 +1,59 @@
+{# Dashboard / projects empty-state partial.
+
+   Two visual states gated on `device_count`:
+     1. device_count == 0  → onboarding CTAs to install the macOS app and
+        Linux CLI, plus a "Connect this Mac" device-flow link and a pointer
+        to the full welcome guide.
+     2. device_count >= 1  → softer "no activity yet" message, on the
+        assumption that the user is already paired and just hasn't synced.
+
+   Inputs (read from parent context):
+     - device_count (int): number of paired devices for this user.
+#}
+{% if device_count and device_count > 0 %}
+  <div class="text-center py-5" data-testid="empty-state-paired">
+    <i class="bi bi-inbox fs-1 text-secondary" aria-hidden="true"></i>
+    <p class="text-secondary mt-2">
+      No activity yet — sync from your paired device to see it here.
+    </p>
+  </div>
+{% else %}
+  <div class="text-center py-5" data-testid="empty-state-onboarding">
+    <i class="bi bi-rocket-takeoff fs-1 text-secondary" aria-hidden="true"></i>
+    <h2 class="h4 mt-3">Welcome — sync your first conversation</h2>
+    <p class="text-secondary">
+      Pair a machine to start streaming Claude Code and Codex sessions
+      into your Contextify Cloud team.
+    </p>
+
+    <div class="d-flex flex-wrap justify-content-center gap-2 mt-4">
+      <a href="/cloud/device"
+         class="btn ctxf-btn-primary"
+         aria-label="Connect this Mac via the device authorization flow">
+        <i class="bi bi-link-45deg me-1" aria-hidden="true"></i>
+        Connect this Mac
+      </a>
+      <a href="https://contextify.sh/download"
+         class="btn btn-outline-primary"
+         aria-label="Download the Contextify macOS app">
+        <i class="bi bi-apple me-1" aria-hidden="true"></i>
+        Download macOS app
+      </a>
+    </div>
+
+    <div class="mt-4 text-start mx-auto" style="max-width: 32rem;">
+      <p class="text-secondary text-sm mb-2 text-center">
+        Or install the Linux CLI on any machine:
+      </p>
+      <pre class="bg-body-tertiary border rounded p-2 mb-2"><code>curl -fsSL https://contextify.sh/install.sh | sh</code></pre>
+      <p class="text-center mb-0">
+        <a href="https://contextify.sh/welcome/"
+           class="text-secondary text-sm"
+           aria-label="See the full Contextify setup guide">
+          See the full guide
+          <i class="bi bi-arrow-right" aria-hidden="true"></i>
+        </a>
+      </p>
+    </div>
+  </div>
+{% endif %}

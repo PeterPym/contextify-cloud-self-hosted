@@ -1,0 +1,28 @@
+{% extends "email/base.html" %}
+{% block subject %}Confirm your Contextify Cloud email change{% endblock %}
+{% block preheader %}Confirm the new email address for your Contextify Cloud account.{% endblock %}
+{% block content %}
+<h1 style="margin:0 0 12px 0;font-size:22px;line-height:30px;font-weight:600;color:#1E293B;letter-spacing:-0.2px;">Confirm your new email.</h1>
+<p style="margin:0 0 16px 0;font-size:15px;line-height:22px;color:#334155;">We received a request to change the email on your Contextify Cloud account to this address. Confirm to make the change.</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:8px 0 4px 0;">
+  <tr>
+    <td style="border-radius:8px;background:#4A7BA7;">
+      <a href="{{ confirm_url }}" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;line-height:20px;">Confirm email change</a>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:16px 0 4px 0;font-size:13px;line-height:20px;color:#94A3B8;">Link expires in 60 minutes.</p>
+
+<p style="margin:24px 0 6px 0;font-size:13px;line-height:20px;color:#64748B;">Trouble with the button? Paste this URL into your browser:</p>
+<p style="margin:0 0 8px 0;font-size:13px;line-height:20px;color:#475569;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;">{{ confirm_url }}</p>
+
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#F1F5F9;border:1px solid #CBD5E1;border-radius:8px;margin-top:20px;">
+  <tr>
+    <td style="padding:14px 16px;font-size:13px;line-height:20px;color:#475569;">
+      <strong style="color:#1E293B;">Didn't request this change?</strong> Ignore this email — your account email won't change.
+    </td>
+  </tr>
+</table>
+{% endblock %}

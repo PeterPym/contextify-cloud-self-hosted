@@ -1,0 +1,37 @@
+{% extends "email/base.html" %}
+{% block subject %}Welcome to Contextify Cloud{% endblock %}
+{% block preheader %}Your Contextify Cloud account is ready. {{ cta }} in two clicks.{% endblock %}
+{% block content %}
+<h1 style="margin:0 0 12px 0;font-size:24px;line-height:32px;font-weight:600;color:#1E293B;letter-spacing:-0.2px;">Your account is ready.</h1>
+<p style="margin:0 0 20px 0;font-size:16px;line-height:24px;color:#334155;">Welcome{% if display_name %}, {{ display_name }}{% endif %}. Sign in once on this {{ device }}, and your Claude Code and Codex history stays in sync across every Mac and Linux machine you use Contextify on.</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:8px 0 4px 0;">
+  <tr>
+    <td style="border-radius:8px;background:#4A7BA7;">
+      <a href="{{ connect_url }}" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;line-height:20px;">{{ cta }} &rsaquo;</a>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:24px 0 8px 0;font-size:13px;line-height:20px;color:#64748B;font-weight:600;text-transform:uppercase;letter-spacing:0.4px;">What you just unlocked</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+  <tr>
+    <td style="padding:10px 0;border-top:1px solid #F1F5F9;font-size:15px;line-height:22px;color:#334155;">
+      <span style="color:#51A86B;font-weight:700;">&#x2713;</span>&nbsp;&nbsp;Sync across all your Macs and Linux machines
+    </td>
+  </tr>
+  <tr>
+    <td style="padding:10px 0;border-top:1px solid #F1F5F9;font-size:15px;line-height:22px;color:#334155;">
+      <span style="color:#51A86B;font-weight:700;">&#x2713;</span>&nbsp;&nbsp;Full conversation history retained
+    </td>
+  </tr>
+  <tr>
+    <td style="padding:10px 0;border-top:1px solid #F1F5F9;border-bottom:1px solid #F1F5F9;font-size:15px;line-height:22px;color:#334155;">
+      <span style="color:#51A86B;font-weight:700;">&#x2713;</span>&nbsp;&nbsp;Search every session you have ever had
+    </td>
+  </tr>
+</table>
+
+<p style="margin:20px 0 0 0;font-size:14px;line-height:22px;color:#475569;">Adding another Mac or Linux machine? Open Contextify on it, choose <strong style="color:#1E293B;">Settings &rsaquo; Cloud</strong>, then connect it. Your history will catch up automatically.</p>
+{% endblock %}
+{% block footer %}Need help? Reply to this email or visit <a href="https://contextify.sh/help" style="color:#4A7BA7;text-decoration:none;">contextify.sh/help</a>.{% endblock %}

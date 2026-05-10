@@ -1,0 +1,13 @@
+Click the button below to finish connecting Contextify on {{ device_name }}:
+
+  {{ magic_link_url }}
+
+Can't use the button? Enter this 6-digit code on the sign-in page:
+
+  {{ otp_code }}
+
+This link and code expire in {{ expires_in_minutes }} minutes.
+
+If you didn't request this, you can safely ignore this email.
+
+— Contextify

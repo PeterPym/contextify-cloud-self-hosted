@@ -1,0 +1,17 @@
+Use this secure link to connect Contextify on {{ device_name }}:
+
+  {{ magic_link_url }}
+
+Can't use the button? Enter this 6-digit code on the sign-in page:
+
+  {{ otp_code }}
+
+This link and code expire in {{ expires_in_minutes }} minutes.
+
+We'll create your free Contextify Cloud account ({{ signup_email }}) after you
+confirm this email. Contextify Cloud securely syncs your AI coding history so
+you can search and reuse past work across devices.
+
+If you didn't request this, ignore this email. No account will be created.
+
+— Contextify

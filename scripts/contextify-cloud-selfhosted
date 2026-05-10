@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run Contextify self-hosted maintenance commands from a source checkout.
+#
+# Prefer the packaged CLI when uv or a local virtualenv is available. Fall back
+# to the stdlib-only self_hosted_ops module so backup/health/update remain usable
+# on a minimally bootstrapped host.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_DIR"
+
+if command -v uv >/dev/null 2>&1; then
+  exec uv run contextify-cloud "$@"
+fi
+
+if [[ -x "$REPO_DIR/.venv/bin/contextify-cloud" ]]; then
+  exec "$REPO_DIR/.venv/bin/contextify-cloud" "$@"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 -m contextify_cloud.cli.self_hosted_ops "$@"
+fi
+
+echo "Contextify self-hosted maintenance requires uv, .venv/bin/contextify-cloud, or python3." >&2
+exit 127

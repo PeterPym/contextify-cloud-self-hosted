@@ -1,0 +1,250 @@
+<!-- htmx partial: sync status content (polled every 30s during active sync) -->
+
+<!-- Out-of-band update: keep the page header badge in sync -->
+{% if include_oob_badge %}
+<div id="sync-page-status-badge" hx-swap-oob="true">
+  {% if overview.is_syncing %}
+  <span class="badge ctxf-sync-badge-syncing">
+    <span class="ctxf-sync-pulse me-1"></span>Syncing
+  </span>
+  {% elif overview.active_session and overview.active_session.is_stalled %}
+  <span class="badge ctxf-sync-badge-stalled">
+    <i class="bi bi-exclamation-triangle-fill me-1"></i>Attention needed
+  </span>
+  {% else %}
+  <span class="badge ctxf-sync-badge-idle">
+    <i class="bi bi-check-circle-fill me-1"></i>Healthy
+  </span>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Active Upload Progress -->
+{% if overview.active_session %}
+<div class="card ctxf-card ctxf-sync-progress-card mb-4">
+  <div class="card-body">
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <h5 class="card-title mb-0">
+        {% if overview.active_session.is_stalled %}
+        <i class="bi bi-pause-circle text-warning me-2"></i>Catch-up Paused
+        {% else %}
+        <i class="bi bi-cloud-upload me-2"></i>Catch-up in Progress
+        {% endif %}
+      </h5>
+      {% if overview.active_session.eta_display != "Unknown" %}
+      <span class="text-secondary text-sm">
+        ETA: {{ overview.active_session.eta_display }}
+      </span>
+      {% endif %}
+    </div>
+
+    {% if overview.active_session.progress_percent is not none %}
+    <div class="progress ctxf-sync-progress mb-3" role="progressbar"
+         aria-valuenow="{{ overview.active_session.progress_percent|int }}"
+         aria-valuemin="0" aria-valuemax="100">
+      <div class="progress-bar {% if overview.active_session.is_stalled %}bg-warning{% else %}ctxf-progress-bar-syncing{% endif %}"
+           style="width: {{ overview.active_session.progress_percent }}%">
+        {{ overview.active_session.progress_percent|round(1) }}%
+      </div>
+    </div>
+    {% else %}
+    <div class="progress ctxf-sync-progress mb-3" role="progressbar">
+      <div class="progress-bar progress-bar-striped progress-bar-animated ctxf-progress-bar-syncing"
+           style="width: 100%">
+        Syncing...
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="row text-sm">
+      <div class="col-sm-4">
+        <span class="text-secondary">Batches completed</span>
+        <div class="fw-medium">
+          {{ "{:,}".format(overview.active_session.completed_batches) }}{% if overview.active_session.total_batches %} / {{ "{:,}".format(overview.active_session.total_batches) }}{% endif %}
+        </div>
+      </div>
+      <div class="col-sm-4">
+        <span class="text-secondary">Started</span>
+        <div class="fw-medium">
+          {{ overview.active_session.started_at.strftime('%H:%M:%S') }}
+        </div>
+      </div>
+      <div class="col-sm-4">
+        <span class="text-secondary">Last batch</span>
+        <div class="fw-medium">
+          {% if overview.active_session.last_batch_at %}
+          {{ overview.active_session.last_batch_at.strftime('%H:%M:%S') }}
+          {% else %}
+          --
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    {% if overview.active_session.is_stalled %}
+    <div class="alert alert-warning ctxf-sync-alert mt-3 mb-0">
+      <i class="bi bi-info-circle me-1"></i>
+      No catch-up batches were received in the last 3 minutes. If a large upload is still expected,
+      the app may have paused or lost connectivity. Sync will resume automatically when the app reconnects.
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<!-- Overview Stats -->
+<div class="row mb-4">
+  <div class="col-sm-6 col-lg-3 mb-3">
+    <div class="card ctxf-card h-100">
+      <div class="card-body text-center">
+        <div class="ctxf-stat-value">{{ "{:,}".format(overview.entries_synced) }}</div>
+        <div class="ctxf-stat-label">Entries Synced</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3 mb-3">
+    <div class="card ctxf-card h-100">
+      <div class="card-body text-center">
+        <div class="ctxf-stat-value">{{ overview.devices|length }}</div>
+        <div class="ctxf-stat-label">Devices</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3 mb-3">
+    <div class="card ctxf-card h-100">
+      <div class="card-body text-center">
+        <div class="ctxf-stat-value ctxf-stat-text">{{ overview.last_sync_ago }}</div>
+        <div class="ctxf-stat-label">Last Sync</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3 mb-3">
+    <div class="card ctxf-card h-100">
+      <div class="card-body text-center">
+        <div class="ctxf-stat-value">{{ "{:,}".format(overview.server_sequence) }}</div>
+        <div class="ctxf-stat-label">Server Sequence</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Devices -->
+<div class="card ctxf-card mb-4">
+  <div class="card-body">
+    <h5 class="card-title mb-3">
+      <i class="bi bi-laptop me-2"></i>Devices
+    </h5>
+    {% if overview.devices %}
+    <div class="table-responsive">
+      <table class="table table-sm ctxf-devices-table mb-0">
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>Status</th>
+            <th>OS</th>
+            <th>App Version</th>
+            <th>Last Sync</th>
+            <th>Registered</th>
+            {% if auth is defined and auth.role in ['owner', 'admin'] %}
+            <th>Actions</th>
+            {% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for device in overview.devices %}
+          <tr id="device-row-{{ device.id }}">
+            <td>
+              <div class="d-flex align-items-center gap-2">
+                <i class="bi bi-display text-secondary"></i>
+                <span class="fw-medium">{{ device.machine_name }}</span>
+              </div>
+            </td>
+            <td>
+              {% if device.health == "syncing" %}
+              <span class="badge ctxf-device-badge-syncing">
+                <span class="ctxf-sync-pulse me-1"></span>Syncing
+              </span>
+              {% elif device.health == "recently_active" %}
+              <span class="badge ctxf-device-badge-healthy">
+                <i class="bi bi-check-circle-fill me-1"></i>Connected
+              </span>
+              {% elif device.health == "healthy" %}
+              <span class="badge ctxf-device-badge-healthy">
+                <i class="bi bi-check-circle-fill me-1"></i>Connected
+              </span>
+              {% elif device.health == "stalled" %}
+              <span class="badge ctxf-device-badge-stalled">
+                <i class="bi bi-pause-circle-fill me-1"></i>Paused
+              </span>
+              {% elif device.health == "inactive" %}
+              <span class="badge ctxf-device-badge-inactive">
+                <i class="bi bi-moon me-1"></i>Inactive
+              </span>
+              {% else %}
+              <span class="badge ctxf-device-badge-never">
+                <i class="bi bi-dash-circle me-1"></i>Never synced
+              </span>
+              {% endif %}
+            </td>
+            <td class="text-secondary">{{ device.os or '--' }}</td>
+            <td class="text-secondary">{{ device.app_version or '--' }}</td>
+            <td class="text-secondary">{{ device.last_sync_ago }}</td>
+            <td class="text-secondary">{{ device.created_at.strftime('%b %d, %Y') }}</td>
+            {% if auth is defined and auth.role in ['owner', 'admin'] %}
+            <td>
+              <button class="btn btn-outline-danger btn-sm"
+                      hx-delete="/cloud/sync/devices/{{ device.id }}"
+                      hx-target="#device-row-{{ device.id }}"
+                      hx-swap="outerHTML"
+                      hx-confirm="Unlink {{ device.machine_name }}? The device will re-register on its next sync."
+                      title="Unlink device">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="text-center py-4">
+      <i class="bi bi-laptop fs-3 text-secondary d-block mb-2"></i>
+      <p class="text-secondary mb-0">
+        No devices registered yet. Connect the Contextify app to start syncing.
+      </p>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Sync Details -->
+<div class="card ctxf-card">
+  <div class="card-body">
+    <h5 class="card-title mb-3">
+      <i class="bi bi-info-circle me-2"></i>Details
+    </h5>
+    <div class="row">
+      <div class="col-sm-4 text-secondary fw-medium">Last sync</div>
+      <div class="col-sm-8">
+        {% if overview.last_sync %}
+        {{ overview.last_sync.strftime('%B %d, %Y at %H:%M:%S UTC') }}
+        {% else %}
+        Never
+        {% endif %}
+      </div>
+    </div>
+    <hr class="my-2">
+    <div class="row">
+      <div class="col-sm-4 text-secondary fw-medium">Server sequence</div>
+      <div class="col-sm-8">
+        <code>{{ "{:,}".format(overview.server_sequence) }}</code>
+      </div>
+    </div>
+    <hr class="my-2">
+    <div class="row">
+      <div class="col-sm-4 text-secondary fw-medium">Active catch-up sessions</div>
+      <div class="col-sm-8">{{ overview.pending_sessions }}</div>
+    </div>
+  </div>
+</div>

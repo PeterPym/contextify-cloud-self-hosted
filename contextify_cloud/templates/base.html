@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark light">
+  <meta name="csrf-token" content="{{ csrf_token | default('') }}">
+  <title>{% block title %}Contextify Cloud{% endblock %}</title>
+
+  <!-- Favicon -->
+  <link rel="icon" href="{{ url_for('static', path='favicon.ico') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='apple-touch-icon.png') }}">
+
+  <script id="ctxf-theme-bootstrap" nonce="{{ csp_nonce }}">
+    (function() {
+      const html = document.documentElement;
+
+      function getPreferredTheme() {
+        const saved = localStorage.getItem('ctxf-theme');
+        if (saved) return saved;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+
+      function applyTheme(theme) {
+        html.setAttribute('data-bs-theme', theme);
+        html.style.colorScheme = theme;
+        html.style.backgroundColor = theme === 'dark' ? '#0f172a' : '#ffffff';
+      }
+
+      const initialTheme = getPreferredTheme();
+      applyTheme(initialTheme);
+      window.__ctxfGetPreferredTheme = getPreferredTheme;
+      window.__ctxfApplyTheme = applyTheme;
+    })();
+  </script>
+
+  <!-- Bootstrap 5.3.3 (vendored) -->
+  <link href="/cloud/static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
+
+  <!-- Bootstrap Icons (vendored) -->
+  <link href="/cloud/static/vendor/bootstrap-icons/font/bootstrap-icons.min.css" rel="stylesheet">
+
+  <!-- Dashboard styles -->
+  <link href="/cloud/static/dashboard.css" rel="stylesheet">
+
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+  <!-- Top navbar -->
+  <nav class="navbar navbar-expand-lg ctxf-navbar sticky-top">
+    <div class="container-fluid">
+      <a class="navbar-brand ctxf-brand" href="/cloud/">
+        <i class="bi bi-cloud-fill me-2"></i>Contextify
+      </a>
+      {% if not (hide_sidebar is defined and hide_sidebar) %}
+      <button class="navbar-toggler" type="button"
+              data-bs-toggle="collapse" data-bs-target="#sidebarCollapse"
+              aria-controls="sidebarCollapse" aria-expanded="false"
+              aria-label="Toggle navigation">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      {% endif %}
+      <ul class="navbar-nav ms-auto d-flex flex-row align-items-center gap-2">
+        <li class="nav-item">
+          <button class="btn btn-link nav-link" id="themeToggle"
+                  aria-label="Toggle dark mode">
+            <i class="bi bi-moon-fill" id="themeIcon"></i>
+          </button>
+        </li>
+        {% if auth is defined and auth and not (hide_sidebar is defined and hide_sidebar) %}
+        <li class="nav-item dropdown">
+          <a class="nav-link dropdown-toggle" href="#" role="button"
+             data-bs-toggle="dropdown" aria-expanded="false">
+            <i class="bi bi-person-circle me-1"></i>Account
+          </a>
+          <ul class="dropdown-menu dropdown-menu-end">
+            <li><a class="dropdown-item" href="/cloud/settings">Settings</a></li>
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <form method="post" action="/cloud/logout" style="margin:0;">
+                {% if csrf_token is defined and csrf_token %}
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                {% endif %}
+                <button type="submit" class="dropdown-item">Sign out</button>
+              </form>
+            </li>
+          </ul>
+        </li>
+        {% endif %}
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Page content -->
+  <main class="ctxf-main">
+    {% if hide_sidebar is defined and hide_sidebar %}
+    {% block content_nosidebar %}{% endblock %}
+    {% else %}
+    <div class="container-fluid">
+      <div class="row">
+        <!-- Personal Self-Hosted mirror omits hosted dashboard navigation. -->
+        <!-- Main content -->
+        <div class="col-12 col-md-9 col-lg-10 ctxf-content">
+          {% block content %}{% endblock %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </main>
+
+  <!-- Footer -->
+  <footer class="ctxf-footer">
+    <div class="container-fluid">
+      <div class="row">
+        <div class="col-md-4 mb-3 mb-md-0">
+          <span class="ctxf-footer-brand">Contextify</span>
+          <p class="ctxf-footer-tagline">
+            Project-centric AI session management for macOS.
+          </p>
+        </div>
+        <div class="col-md-4 mb-3 mb-md-0">
+          <h6 class="ctxf-footer-heading">Product</h6>
+          <ul class="list-unstyled ctxf-footer-links">
+            <li><a href="https://contextify.sh/#download">Download</a></li>
+            <li><a href="https://contextify.sh/pricing">Pricing</a></li>
+            <li><a href="https://contextify.sh/blog">Blog</a></li>
+          </ul>
+        </div>
+        <div class="col-md-4">
+          <h6 class="ctxf-footer-heading">Legal &amp; Support</h6>
+          <ul class="list-unstyled ctxf-footer-links">
+            <li><a href="https://contextify.sh/privacy">Privacy</a></li>
+            <li><a href="https://contextify.sh/terms">Terms</a></li>
+            <li><a href="https://github.com/PeterPym/contextify/issues">Support</a></li>
+            <li><a href="mailto:support@contextify.sh">Contact</a></li>
+          </ul>
+        </div>
+      </div>
+      <hr class="ctxf-footer-divider">
+      <p class="ctxf-footer-copyright">
+        &copy; {{ current_year }} Contextify. All rights reserved.
+      </p>
+    </div>
+  </footer>
+
+  <!-- Bootstrap JS (vendored) -->
+  <script src="/cloud/static/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+
+  <!-- htmx (vendored) -->
+  <script src="/cloud/static/vendor/htmx/htmx.min.js"></script>
+
+  <!-- CSRF header injection for htmx requests -->
+  <script src="/cloud/static/js/csrf-htmx.js"></script>
+
+  <!-- Dark mode detection and toggle -->
+  <script src="/cloud/static/js/theme-toggle.js"></script>
+
+  {% block scripts_extra %}{% endblock %}
+</body>
+</html>

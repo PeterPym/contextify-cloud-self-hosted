@@ -1,0 +1,13 @@
+Confirm your Contextify Cloud email change.
+
+We received a request to change the email on your Contextify Cloud account to
+this address. Confirm to make the change:
+
+  {{ confirm_url }}
+
+Link expires in 60 minutes.
+
+Didn't request this change? Ignore this email — your account email won't
+change.
+
+— Contextify
