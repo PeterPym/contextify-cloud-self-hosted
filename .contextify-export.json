@@ -1,7 +1,7 @@
 {
   "files": {
     ".env.example": "6b9ad6e69dfb07eff6e2eba0c8ce338cf058df5c65d60c3358880ec9ebe8e790",
-    ".github/workflows/publish-ghcr.yml": "3383f776feb3e318a8180468368698dafd6aa93b0931576e2205c9c1c042db8e",
+    ".github/workflows/publish-ghcr.yml": "25d7557f71c1538607af8b08fe923d52a33462cbecf8ac2523ae4140a6aed9b0",
     "Dockerfile": "994f135fec01d02155471247603c10256d89531df164a2b84cbd36cd3b958c43",
     "README.md": "3f0e17f33d8e015fc7d21cf0565439037df1f5bb3494a75f21932267e2ca45a9",
     "alembic.ini": "8b13f715b89cb7fba337bb177f2f7a7380888f5e5480127dede65b6f6b0ec376",

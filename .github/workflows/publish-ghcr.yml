@@ -119,6 +119,7 @@ jobs:
           set -euo pipefail
           docker push "${{ steps.image.outputs.image }}:${{ steps.image.outputs.version }}"
 
+
       - name: Make GHCR package public
         shell: bash
         env:
@@ -142,6 +143,7 @@ jobs:
           echo "::error::Unable to make GHCR package public: $visibility_path"
           exit 1
 
+
       - name: Summarize image publish
         if: always()
         shell: bash
@@ -152,5 +154,6 @@ jobs:
             echo "- Image: \`${{ steps.image.outputs.image || 'unresolved' }}\`"
             echo "- Version: \`${{ steps.image.outputs.version || 'unresolved' }}\`"
             echo "- Package: \`${{ steps.image.outputs.package || 'unresolved' }}\`"
+            echo "- Visibility: \`public\`"
             echo "- Job status: \`${{ job.status }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
