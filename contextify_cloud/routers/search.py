@@ -35,6 +35,11 @@ router = APIRouter(prefix="/api/v1/search", tags=["search"])
 async def search(
     q: str = Query(..., min_length=1, description="Search query"),
     project_id: str | None = Query(None, description="Filter by project"),
+    team: bool = Query(
+        False,
+        description="Include a teammate's entries for this project when that teammate has "
+        "shared their own entries for it (members only; requires project_id; per-contributor)",
+    ),
     user_id: str | None = Query(None, description="Filter by user (admin only)"),
     since: str | None = Query(None, description="Filter entries after this date (YYYY-MM-DD)"),
     limit: int = Query(20, ge=1, le=100),
@@ -67,6 +72,15 @@ async def search(
 
     where_clauses = ["e.search_vector @@ plainto_tsquery('english', :query)"]
 
+    # Normalize project_id once: an empty/whitespace `?project_id=` binds as "" (not None).
+    # The project WHERE fragment AND the ct-2250 team-widening gate below MUST key off the SAME
+    # normalized value. Otherwise an empty project_id trips the widening gate (`"" is not None`
+    # is True) while skipping the project bound (`if project_id:` is falsy) -- which would drop
+    # member scoping entirely for a tenant-wide read. Treat blank as absent everywhere so the
+    # gate and the filter can never disagree. Strip FIRST, then collapse to None: a
+    # whitespace-only "  " must become None, not "" (the `x.strip() if x else None` ordering
+    # leaves "  " -> "", which still trips the gate). (dual review-loop P0, ct-2250)
+    project_id = (project_id or "").strip() or None
     if project_id:
         where_clauses.append("e.project_id = :project_id")
         params["project_id"] = project_id
@@ -74,23 +88,48 @@ async def search(
     # Scope by user role using the shared utility (consistent with other endpoints).
     # Members/viewers can only see their own entries.
     # Owners/admins see all; they can optionally filter by user_id param.
-    scope_clause, scope_params = build_user_scope_clause(
-        auth, column="e.uploaded_by_user_id", param_name="scope_user_id"
-    )
-    if scope_clause:
-        where_clauses.append(scope_clause.removeprefix("AND ").strip())
-        params.update(scope_params)
-    elif user_id:
-        # Full-access users can optionally filter by a specific user.
-        # Validate as UUID to avoid DB errors on bad input.
-        try:
-            uuid_mod.UUID(user_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="Invalid user_id format. Expected a UUID."
-            )
-        where_clauses.append("e.uploaded_by_user_id = :scope_user_id")
-        params["scope_user_id"] = user_id
+    #
+    # ct-2250 (per-user share): team-aware recall is gated PER CONTRIBUTOR, not per project and
+    # not on corpus membership. Each user controls whether THEIR OWN entries for a project are
+    # team-visible via a row in {schema}.project_team_shares (default: unshared/no row). A MEMBER
+    # (not viewer, not owner/admin) who opts in (team=True) AND targets a specific project
+    # (project_id) sees their OWN rows plus rows whose AUTHOR has shared that project -- and
+    # nothing else. So one user's share exposes only that user's entries; no one else's data is
+    # touched by it (no co-contributor exposure, no discovery/consent complexity). The share set
+    # is read on every query, so un-share (DELETE) takes effect immediately. team defaults False
+    # so existing callers are unchanged. Viewers/no-project/empty-project stay own-only;
+    # owners/admins already see all via build_user_scope_clause.
+    team_eligible = team and project_id is not None and auth.role == "member"
+    if team_eligible:
+        logger.info(
+            "Team-aware search (per-user share): tenant=%s user=%s project=%s",
+            auth.tenant_id, auth.user_id, project_id,
+        )
+        # Own rows OR rows whose author shared THIS project. Bound, not a tenant-wide widen.
+        where_clauses.append(
+            "(e.uploaded_by_user_id = :scope_user_id OR e.uploaded_by_user_id IN "
+            f"(SELECT user_id FROM {schema}.project_team_shares WHERE project_id = :share_pid))"
+        )
+        params["scope_user_id"] = str(auth.user_id)
+        params["share_pid"] = project_id
+    else:
+        scope_clause, scope_params = build_user_scope_clause(
+            auth, column="e.uploaded_by_user_id", param_name="scope_user_id"
+        )
+        if scope_clause:
+            where_clauses.append(scope_clause.removeprefix("AND ").strip())
+            params.update(scope_params)
+        elif user_id:
+            # Full-access users can optionally filter by a specific user.
+            # Validate as UUID to avoid DB errors on bad input.
+            try:
+                uuid_mod.UUID(user_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid user_id format. Expected a UUID."
+                )
+            where_clauses.append("e.uploaded_by_user_id = :scope_user_id")
+            params["scope_user_id"] = user_id
 
     if since:
         try:
@@ -128,7 +167,8 @@ async def search(
                ) as snippet,
                e.project_id, p.name as project_name,
                e.transcript_id,
-               u.name as user_name, u.email as user_email
+               u.name as user_name, u.email as user_email,
+               (e.uploaded_by_user_id = :auth_uid) as is_own
         FROM {schema}.transcript_entries e
         LEFT JOIN {schema}.projects p ON e.project_id = p.id
         LEFT JOIN public.users u ON e.uploaded_by_user_id = u.id
@@ -137,6 +177,9 @@ async def search(
         LIMIT :limit OFFSET :offset
     """
 
+    # Bind the caller id for the per-row is_own provenance flag (search query only; the
+    # count query above does not reference it).
+    params["auth_uid"] = str(auth.user_id)
     result = await db.execute(text(search_sql), params)
     rows = result.fetchall()
 
@@ -166,6 +209,7 @@ async def search(
             project_name=row.project_name,
             user_name=row.user_name,
             user_email=row.user_email,
+            is_own=bool(row.is_own),
         ))
 
     elapsed_ms = (time.monotonic() - start) * 1000

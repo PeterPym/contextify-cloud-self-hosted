@@ -33,6 +33,8 @@ from contextify_cloud.services.email import (
     send_password_reset,
     send_welcome_email,
 )
+from contextify_cloud.services.funnel_events import emit_funnel_event
+from contextify_cloud.services.operator_notifications import notify_new_signup
 from contextify_cloud.services.tenant import _sanitize_slug, provision_tenant
 from contextify_cloud.utils.email import (
     hash_email_for_logs,
@@ -832,6 +834,17 @@ async def register_with_password(
     await db.commit()
 
     await send_welcome_email(email_clean, name, user_agent=user_agent)
+    await notify_new_signup(
+        email=email_clean,
+        tenant_id=str(tenant.id),
+        plan=tenant.plan,
+        user_agent=user_agent,
+    )
+    # ct-2080: funnel event (no-op unless hosted backend registered). Opaque
+    # tenant id only; coarse metadata.
+    await emit_funnel_event(
+        "signup", distinct_id=str(tenant.id), properties={"plan": tenant.plan}
+    )
     logger.info(
         "Queued verification email for new account: token_id=%s account=%s",
         verify_auth_token.id,
@@ -1904,6 +1917,29 @@ async def _finalize_device_token(
             email_normalized=welcome_email_norm or "",
             user_agent=welcome_user_agent,
         )
+        # ct-2076: operator signup notification (same was_new_signup gate, so
+        # invited-user and login/race-loser paths are excluded). Fire-and-forget.
+        await notify_new_signup(
+            email=welcome_email_to,
+            tenant_id=str(tenant.id),
+            plan=tenant.plan,
+            user_agent=welcome_user_agent,
+        )
+        # ct-2080: signup funnel event, only for genuine new signups (gated by
+        # was_new_signup, like the notification above). No-op unless a hosted
+        # backend is registered.
+        await emit_funnel_event(
+            "signup", distinct_id=str(tenant.id), properties={"plan": tenant.plan}
+        )
+
+    # ct-2080 (CT2080-2): device_authorized fires on EVERY successful device
+    # finalization (new signup AND an existing account authorizing a new device,
+    # e.g. sign up in browser -> authorize the app later), not only new signups.
+    await emit_funnel_event(
+        "device_authorized",
+        distinct_id=str(tenant.id),
+        properties={"plan": tenant.plan},
+    )
 
     return FinalizeResult(
         account=account,

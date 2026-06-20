@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,6 +18,8 @@ from contextify_cloud.schemas import (
     ProjectContributor,
     ProjectContributorsResponse,
     ProjectDetail,
+    ProjectShareRequest,
+    ProjectShareResponse,
     ProjectSummary,
 )
 from contextify_cloud.services.tenant import get_tenant_schema
@@ -69,6 +72,74 @@ async def _ensure_project_visible(
     )
     if not visible.first():
         raise HTTPException(status_code=404, detail="Project not found.")
+
+
+@router.post("/{project_id}/share", response_model=ProjectShareResponse)
+async def set_project_share(
+    project_id: str,
+    body: ProjectShareRequest,
+    auth: Annotated[AuthContext, Depends(require_scope("sync"))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ProjectShareResponse:
+    """Set whether the CALLER'S OWN entries for a project are team-visible (ct-2250).
+
+    PER-USER share: each user controls only their own entries. Sharing inserts a row in
+    {schema}.project_team_shares (caller's user_id, project_id); un-sharing deletes it.
+    The team-aware search gate surfaces a teammate's row only if THAT teammate has a share
+    record for the project, so flipping your share affects only your own data -- no one
+    else's entries are exposed by your action, and no one else's action exposes yours.
+    This makes the privacy story trivially correct: you only ever expose what you yourself
+    switched on, and un-share takes effect immediately (the gate reads the share set every
+    query).
+
+    Permission is CONTRIBUTOR-scoped for EVERY role (including owner/admin): you can only
+    share a project you actually have entries in, because under per-user share there is
+    nothing else to share -- a share row only governs the caller's own entries. The check
+    keys on `uploaded_by_user_id = caller`; since transcript_entries.project_id FKs to
+    projects(id), having an entry implies the project row exists, so the INSERT's
+    project_id FK is satisfied (no contributor -> 404). No viewer special-case is needed: a
+    viewer that synced entries controls its own; a viewer (or owner) with no entries simply
+    fails the contributor check.
+    """
+    schema = await _resolve_schema(auth, db)
+    # Contributor check for ALL roles: the caller must have at least one entry in this
+    # project. Under per-user share you only ever share your OWN entries, so a caller with
+    # none has nothing to share (404), and this also rejects an unrelated/nonexistent
+    # project_id. (Distinct from _ensure_project_visible, which exempts full-access roles.)
+    contributes = await db.execute(
+        text(
+            f"SELECT 1 FROM {schema}.transcript_entries "
+            "WHERE project_id = :project_id AND uploaded_by_user_id = :user_id LIMIT 1"
+        ),
+        {"project_id": project_id, "user_id": str(auth.user_id)},
+    )
+    if not contributes.first():
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    if body.shared:
+        now_epoch = int(datetime.now(UTC).timestamp())
+        await db.execute(
+            text(
+                f"INSERT INTO {schema}.project_team_shares (user_id, project_id, created_at) "
+                "VALUES (:user_id, :project_id, :now) "
+                "ON CONFLICT (user_id, project_id) DO NOTHING"
+            ),
+            {"user_id": str(auth.user_id), "project_id": project_id, "now": now_epoch},
+        )
+    else:
+        await db.execute(
+            text(
+                f"DELETE FROM {schema}.project_team_shares "
+                "WHERE user_id = :user_id AND project_id = :project_id"
+            ),
+            {"user_id": str(auth.user_id), "project_id": project_id},
+        )
+    await db.commit()
+    logger.info(
+        "Project share set (per-user): tenant=%s user=%s project=%s shared=%s",
+        auth.tenant_id, auth.user_id, project_id, body.shared,
+    )
+    return ProjectShareResponse(project_id=project_id, shared_with_team=body.shared)
 
 
 @router.get("", response_model=list[ProjectSummary])

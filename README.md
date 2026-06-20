@@ -73,6 +73,11 @@ Personal Self-Hosted excludes hosted-only Stripe billing, internal support,
 growth, hosted ops, team, invitation, analytics, tenant-admin, and commercial
 license-gated route groups.
 
+Personal Self-Hosted is distributed under the Functional Source License,
+Version 1.1, Apache 2.0 Future License (`FSL-1.1-Apache-2.0`). Each
+released version automatically becomes available under the Apache License,
+Version 2.0 on the second anniversary of that version's release date.
+
 The generated mirror remains source-available/proprietary unless a release
 artifact states different license terms. Do not patch the generated mirror by
 hand; change the canonical repo and regenerate it.
@@ -128,14 +133,18 @@ empty. See `docs/user/auth-workflows.md`, `docs/engineering/security-architectur
 ## Testing and Linting
 
 ```bash
-uv run pytest -m "not e2e"             # Run unit/integration tests (1397+)
-uv run pytest --cov=contextify_cloud   # With coverage
-uvx ruff check .                       # Lint (blocking)
-uv run mypy contextify_cloud/          # Type check, strict (blocking)
+uv run pytest --tb=short -q -m "not e2e and not slow"  # CI unit/integration lane
+uv run pytest --cov=contextify_cloud -m "not e2e and not slow"  # Coverage for CI lane
+uvx ruff check .                                        # Lint (blocking)
+uv run mypy contextify_cloud/                           # Type check, strict (blocking)
 uv run python scripts/check_sql_type_mismatches.py  # SQL type guard
 ```
 
-CI excludes E2E from the unit test job with `-m "not e2e"` and runs them in a dedicated `e2e` job. A plain `uv run pytest` without `-m` will attempt to collect E2E tests locally (they require Postgres and Playwright browsers).
+CI excludes E2E and slow real-Postgres tests from the unit test job with
+`-m "not e2e and not slow"`. E2E tests run in a dedicated `e2e` job, while
+slow tests are intentionally outside the default blocking lane. A plain
+`uv run pytest` without `-m` collects every lane locally, including tests that
+require Postgres, Playwright browsers, or large fixtures.
 
 ### E2E Tests (Playwright)
 
@@ -168,7 +177,7 @@ git config core.hooksPath .githooks
 
 CI runs on every push to main via GitHub Actions (`.github/workflows/ci.yml`):
 
-- **lint-and-test:** ruff (blocking), mypy strict (blocking), SQL type guard, pytest (excludes E2E via `-m "not e2e"`)
+- **lint-and-test:** ruff (blocking), mypy strict (blocking), SQL type guard, pytest (excludes E2E and slow tests via `-m "not e2e and not slow"`)
 - **migration-smoke:** alembic upgrade head + alembic check against real Postgres 18
 - **e2e:** Playwright browser tests against a live uvicorn instance with a Postgres 18 service; traces uploaded on failure
 - **deploy:** auto-deploys to production on green main via SSH, with health check and smoke test; requires lint-and-test, migration-smoke, AND e2e to pass

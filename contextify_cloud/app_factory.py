@@ -161,6 +161,7 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
 
 async def _purge_scheduler_loop() -> None:
     """Periodic purge sweep. Runs immediately on startup, then on interval."""
+    from contextify_cloud import monitoring
     from contextify_cloud.services.purge import run_purge_once
 
     logger.info(
@@ -172,8 +173,14 @@ async def _purge_scheduler_loop() -> None:
     try:
         result = await run_purge_once()
         logger.info("Startup purge sweep: purged=%d", result.purged)
-    except Exception:
+    except Exception as exc:
         logger.error("Startup purge sweep failed", exc_info=True)
+        # ct-1841 follow-up (unit-7 audit iter-02): live path captures here.
+        # The main.py-side compat functions are kept in sync but never run
+        # under the production app_factory.lifespan.
+        monitoring.capture_background_exception(
+            exc, job="purge_scheduler", phase="startup"
+        )
 
     while True:
         await asyncio.sleep(settings.purge_check_interval_seconds)
@@ -185,12 +192,16 @@ async def _purge_scheduler_loop() -> None:
                     result.purged,
                     len(result.errors),
                 )
-        except Exception:
+        except Exception as exc:
             logger.error("Scheduled purge sweep failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc, job="purge_scheduler", phase="scheduled"
+            )
 
 
 async def _auth_email_outbox_scheduler_loop() -> None:
     """Periodic auth-token email retry sweep."""
+    from contextify_cloud import monitoring
     from contextify_cloud.services.browser_auth import run_auth_email_outbox_once
 
     logger.info(
@@ -210,8 +221,11 @@ async def _auth_email_outbox_scheduler_loop() -> None:
                 result.exhausted,
                 len(result.errors or []),
             )
-    except Exception:
+    except Exception as exc:
         logger.error("Startup auth email outbox sweep failed", exc_info=True)
+        monitoring.capture_background_exception(
+            exc, job="auth_email_outbox", phase="startup"
+        )
 
     while True:
         await asyncio.sleep(settings.auth_email_outbox_interval_seconds)
@@ -227,8 +241,60 @@ async def _auth_email_outbox_scheduler_loop() -> None:
                     result.exhausted,
                     len(result.errors or []),
                 )
-        except Exception:
+        except Exception as exc:
             logger.error("Scheduled auth email outbox sweep failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc, job="auth_email_outbox", phase="scheduled"
+            )
+
+
+async def _license_delivery_outbox_scheduler_loop() -> None:
+    """Periodic Local Commercial license-delivery retry sweep (ct-2015)."""
+    from contextify_cloud import monitoring
+    from contextify_cloud.services.license_delivery import run_license_delivery_outbox_once
+
+    logger.info(
+        "License delivery outbox scheduler started (interval=%ds)",
+        settings.license_delivery_outbox_interval_seconds,
+    )
+
+    try:
+        result = await run_license_delivery_outbox_once()
+        if result.attempted or result.errors:
+            logger.info(
+                "Startup license delivery outbox sweep: "
+                "attempted=%d sent=%d failed=%d exhausted=%d errors=%d",
+                result.attempted,
+                result.sent,
+                result.failed,
+                result.exhausted,
+                len(result.errors or []),
+            )
+    except Exception as exc:
+        logger.error("Startup license delivery outbox sweep failed", exc_info=True)
+        monitoring.capture_background_exception(
+            exc, job="license_delivery_outbox", phase="startup"
+        )
+
+    while True:
+        await asyncio.sleep(settings.license_delivery_outbox_interval_seconds)
+        try:
+            result = await run_license_delivery_outbox_once()
+            if result.attempted or result.errors:
+                logger.info(
+                    "Scheduled license delivery outbox sweep: "
+                    "attempted=%d sent=%d failed=%d exhausted=%d errors=%d",
+                    result.attempted,
+                    result.sent,
+                    result.failed,
+                    result.exhausted,
+                    len(result.errors or []),
+                )
+        except Exception as exc:
+            logger.error("Scheduled license delivery outbox sweep failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc, job="license_delivery_outbox", phase="scheduled"
+            )
 
 
 @asynccontextmanager
@@ -238,12 +304,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     purge_task = asyncio.create_task(_purge_scheduler_loop())
     auth_email_outbox_task = asyncio.create_task(_auth_email_outbox_scheduler_loop())
+    license_delivery_task = asyncio.create_task(_license_delivery_outbox_scheduler_loop())
+    background_tasks = (purge_task, auth_email_outbox_task, license_delivery_task)
     try:
         yield
     finally:
-        for task in (purge_task, auth_email_outbox_task):
+        for task in background_tasks:
             task.cancel()
-        for task in (purge_task, auth_email_outbox_task):
+        for task in background_tasks:
             try:
                 await task
             except asyncio.CancelledError:
@@ -267,6 +335,16 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
                     request.method,
                     client_ip,
                     content_length,
+                )
+                # ct-1841 follow-up (unit-7 audit): malformed Content-Length
+                # is operational/probe traffic that today never reaches
+                # Sentry because 400 isn't in the global whitelist. Surface
+                # it explicitly so operators can spot probe/abuse waves.
+                from contextify_cloud import monitoring as _monitoring
+                _monitoring.capture_handled_operational_response(
+                    request=request,
+                    status_code=400,
+                    error_kind="invalid_content_length_header",
                 )
                 return Response(
                     content='{"detail":"Invalid Content-Length header."}',
@@ -332,6 +410,64 @@ class HSTSMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _install_exception_handlers(app: FastAPI) -> None:
+    """Register handlers for Pydantic request/response validation failures.
+
+    ct-1841 observability fix: FastAPI's default RequestValidationError
+    handler short-circuits to a 422 response without raising, so 422s were
+    invisible to Sentry (only 413/429/5xx were captured in
+    ErrorMonitoringMiddleware). This explicit handler routes them into
+    Sentry as warnings, after stripping raw user `input` from the response
+    body and any Sentry payload.
+
+    ResponseValidationError is a server bug; we capture it as a Sentry
+    error (vs warning for request-side) and let FastAPI's default
+    behavior (HTTP 500) stand.
+    """
+    from fastapi.exceptions import RequestValidationError, ResponseValidationError
+    from fastapi.responses import JSONResponse
+
+    from contextify_cloud import monitoring as _monitoring
+
+    @app.exception_handler(RequestValidationError)
+    async def _on_request_validation(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        raw_errors: list[dict[str, Any]] = [dict(e) for e in exc.errors()]
+        sanitized = _monitoring.sanitize_pydantic_errors(raw_errors)
+        first = sanitized[0] if sanitized else {}
+        _monitoring.capture_request_validation(
+            request=request,
+            first_loc=".".join(str(p) for p in first.get("loc", [])),
+            first_type=str(first.get("type", "")),
+            error_count=len(sanitized),
+        )
+        return JSONResponse(status_code=422, content={"detail": sanitized})
+
+    @app.exception_handler(ResponseValidationError)
+    async def _on_response_validation(
+        request: Request,
+        exc: ResponseValidationError,
+    ) -> JSONResponse:
+        raw_errors: list[dict[str, Any]] = [dict(e) for e in exc.errors()]
+        sanitized = _monitoring.sanitize_pydantic_errors(raw_errors)
+        first = sanitized[0] if sanitized else {}
+        _monitoring.capture_response_validation(
+            request=request,
+            first_loc=".".join(str(p) for p in first.get("loc", [])),
+            first_type=str(first.get("type", "")),
+            error_count=len(sanitized),
+        )
+        # Response-shape mismatches must not leak server internals to the
+        # client. Return a generic 500 with a stable error code so operators
+        # can correlate via Sentry's request_id tag.
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal response validation error"},
+        )
+
+
 def _install_middleware(app: FastAPI) -> None:
     app.add_middleware(RequestSizeLimitMiddleware)
     app.add_middleware(UnauthRateLimitMiddleware)
@@ -383,7 +519,7 @@ def _include_core_routers(app: FastAPI) -> None:
 
 
 def _include_hosted_routers(app: FastAPI) -> None:
-    from contextify_cloud.hosted import ops_routes
+    from contextify_cloud.hosted import funnel_backend, ops_routes
     from contextify_cloud.routers import (
         admin,
         analytics,
@@ -406,6 +542,10 @@ def _include_hosted_routers(app: FastAPI) -> None:
     app.include_router(team.router)
     app.include_router(tenant_admin.router)
     app.include_router(dashboard.router)
+
+    # ct-2080: register the hosted-only funnel-analytics backend (inert until the
+    # operator provisions the ingest key, ct-2087). HOSTED profile only.
+    funnel_backend.install()
 
 
 def _include_commercial_self_hosted_routers(app: FastAPI) -> None:
@@ -441,6 +581,7 @@ def create_app(profile: CloudProfile | None = None) -> FastAPI:
     app.state.cloud_profile = resolved_profile
 
     _install_middleware(app)
+    _install_exception_handlers(app)
     _install_static(app, resolved_profile)
     _include_core_routers(app)
 

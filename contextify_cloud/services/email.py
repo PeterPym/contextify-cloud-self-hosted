@@ -7,6 +7,7 @@ workflow without external credentials.
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -218,6 +219,56 @@ async def send_welcome_email(
         TransactionalEmail(
             to_email=to_email,
             subject="Welcome to Contextify Cloud",
+            text=text,
+            html=html,
+        )
+    )
+
+
+async def send_local_commercial_license_email(
+    to_email: str,
+    license_token: str,
+    expires_at: datetime,
+) -> bool:
+    """Deliver a freshly minted Local Commercial license token to the buyer (ct-1966).
+
+    Sent once on purchase fulfillment. ``expires_at`` is the token's current
+    expiry; it is rendered as a human date in the body. Renewals re-mint the
+    token silently and are retrievable rather than re-emailed.
+    """
+    context: dict[str, object] = {
+        "license_token": license_token,
+        "expires_date": expires_at.strftime("%B %d, %Y"),
+        **_email_template_defaults(),
+    }
+    text = _render_email_template("email/local_commercial_license.txt", **context)
+    html = _render_email_template("email/local_commercial_license.html", **context)
+    return await send_transactional_email(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Your Contextify Local Commercial license",
+            text=text,
+            html=html,
+        )
+    )
+
+
+async def send_license_retrieval_email(to_email: str, retrieve_url: str) -> bool:
+    """Email a one-time link to retrieve an existing Local Commercial license (ct-2015).
+
+    Sent only when a license exists for the requested email. The link reveals the
+    license once and expires soon; this email never contains the token itself.
+    """
+    context: dict[str, object] = {
+        "retrieve_url": retrieve_url,
+        **_email_template_defaults(),
+    }
+    text = _render_email_template("email/license_retrieval.txt", **context)
+    html = _render_email_template("email/license_retrieval.html", **context)
+    return await send_transactional_email(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Retrieve your Contextify Local Commercial license",
             text=text,
             html=html,
         )

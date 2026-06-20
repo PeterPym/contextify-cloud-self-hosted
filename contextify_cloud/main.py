@@ -21,6 +21,7 @@ validate_runtime_settings = app_factory.validate_runtime_settings
 
 async def _purge_scheduler_loop() -> None:
     """Periodic purge sweep compatibility entry point."""
+    from contextify_cloud import monitoring
     from contextify_cloud.services.purge import run_purge_once
 
     logger.info(
@@ -32,8 +33,15 @@ async def _purge_scheduler_loop() -> None:
     try:
         result = await run_purge_once()
         logger.info("Startup purge sweep: purged=%d", result.purged)
-    except Exception:
+    except Exception as exc:
         logger.error("Startup purge sweep failed", exc_info=True)
+        # ct-1841 follow-up (unit-7 audit): scheduler exceptions never
+        # traverse request middleware, so the existing Sentry hooks miss
+        # them. Capture explicitly with job/phase tags so operators can
+        # see scheduler outages.
+        monitoring.capture_background_exception(
+            exc, job="purge_scheduler", phase="startup"
+        )
 
     while True:
         await asyncio.sleep(settings.purge_check_interval_seconds)
@@ -45,12 +53,16 @@ async def _purge_scheduler_loop() -> None:
                     result.purged,
                     len(result.errors),
                 )
-        except Exception:
+        except Exception as exc:
             logger.error("Scheduled purge sweep failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc, job="purge_scheduler", phase="scheduled"
+            )
 
 
 async def _auth_email_outbox_scheduler_loop() -> None:
     """Periodic auth-token email retry sweep compatibility entry point."""
+    from contextify_cloud import monitoring
     from contextify_cloud.services.browser_auth import run_auth_email_outbox_once
 
     logger.info(
@@ -70,8 +82,12 @@ async def _auth_email_outbox_scheduler_loop() -> None:
                 result.exhausted,
                 len(result.errors or []),
             )
-    except Exception:
+    except Exception as exc:
         logger.error("Startup auth email outbox sweep failed", exc_info=True)
+        # ct-1841 follow-up (unit-7 audit): see _purge_scheduler_loop.
+        monitoring.capture_background_exception(
+            exc, job="auth_email_outbox", phase="startup"
+        )
 
     while True:
         await asyncio.sleep(settings.auth_email_outbox_interval_seconds)
@@ -87,8 +103,11 @@ async def _auth_email_outbox_scheduler_loop() -> None:
                     result.exhausted,
                     len(result.errors or []),
                 )
-        except Exception:
+        except Exception as exc:
             logger.error("Scheduled auth email outbox sweep failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc, job="auth_email_outbox", phase="scheduled"
+            )
 
 
 @asynccontextmanager

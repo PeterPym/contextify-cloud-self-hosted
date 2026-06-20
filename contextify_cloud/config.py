@@ -51,10 +51,23 @@ class Settings(BaseSettings):
     dev_allow_fake_transactional_email: bool = False
     email_from: str = DEFAULT_EMAIL_FROM
     email_reply_to: str = "support@contextify.sh"
+    # ct-2076: operator/ops notification recipient for signup + activation +
+    # paid events. Empty disables all operator notifications (self-hosted has
+    # no central operator). Managed prod sets this to the operator's address.
+    operator_notification_email: str = "rob@contextify.sh"
     email_base_url: str = ""
     auth_email_delivery_max_attempts: int = 3
     auth_email_retry_delay_seconds: int = 300
     auth_email_outbox_interval_seconds: int = 60
+    # Local Commercial license-delivery outbox (ct-2015): retry the initial
+    # purchase-fulfillment email instead of best-effort send.
+    license_delivery_max_attempts: int = 5
+    license_delivery_retry_delay_seconds: int = 300
+    license_delivery_outbox_interval_seconds: int = 60
+    # Anonymous license retrieval (ct-2015): short-lived single-use magic link,
+    # plus a per-email cooldown so the request endpoint cannot be used to email-bomb.
+    license_retrieval_link_ttl_minutes: int = 30
+    license_retrieval_request_cooldown_seconds: int = 120
     tos_version: str = "2026-04-24"
 
     # Invitation settings
@@ -65,6 +78,13 @@ class Settings(BaseSettings):
     cloud_profile: str = ""
     self_hosted: bool = False
     commercial_license_key: str = ""
+    # Ed25519 private signing key (base64url, raw 32 bytes) for the Local
+    # Commercial purchase webhook (ct-1966). Held ONLY by the cloud; mints
+    # offline tokens with kid="lc1" whose public half is baked into the clients.
+    # Empty in dev/CI (no real purchases). In production the purchase webhook
+    # refuses to fulfill without it: it raises so Stripe retries and ops is
+    # alerted, rather than minting unsigned tokens or dropping a paid purchase.
+    commercial_license_signing_key: str = ""
     enable_docs: bool = False  # Set True locally to enable /api/docs, /api/redoc, /openapi.json
     enable_registration: bool = False  # Public self-serve registration is off by default
 
@@ -107,7 +127,16 @@ class Settings(BaseSettings):
     sentry_debug: bool = False
 
     # Sync limits
-    max_batch_size: int = 5000
+    # ct-1841: high backstop only. The real request-size guard is
+    # max_request_body_bytes (50MB); entry inserts already sub-batch at 1000
+    # rows (routers/sync.py). The previous 5000 wall rejected modest but
+    # item-dense catch-up batches (e.g. a 3.4MB push of >5000 small
+    # tool_invocation/usage rows) with an all-or-nothing 413 BEFORE the
+    # handler's partial-accept path ran; clients that do not catch 413 then
+    # retried the same batch forever and never drained. Raised so the byte cap
+    # governs. Follow-up: sub-batch the per-row summary/usage/tool_invocation/
+    # metadata inserts for latency at very high counts (currently O(N) round-trips).
+    max_batch_size: int = 50_000
     max_entry_content_bytes: int = 1_000_000  # 1MB per entry content field
     max_request_body_bytes: int = 50_000_000  # 50MB overall request body limit
     idempotency_ttl_hours: int = 24  # How long idempotency keys are retained

@@ -14,7 +14,7 @@ import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -165,7 +165,18 @@ def init_error_monitoring() -> bool:
         "before_send": scrub_event,
         "debug": settings.sentry_debug,
         "environment": settings.sentry_environment,
+        # Conversation-content boundary (ct-1660):
+        #   - max_request_body_size="never" prevents request bodies from
+        #     reaching Sentry.
+        #   - include_local_variables=False prevents Python stack-frame
+        #     locals (e.g. transcript_text, entry_content in scope at the
+        #     time of an exception) from being serialised to Sentry.
+        # Both options harden the Privacy §7 claim that conversation
+        # content is not sent to Sentry. Cloud code must NOT interpolate
+        # transcript / prompt / response content into logger calls or
+        # exception strings; see build/docs/operations/error-monitoring.md.
         "max_request_body_size": "never",
+        "include_local_variables": False,
         "release": settings.sentry_release or f"contextify-cloud@{__version__}",
         "sample_rate": settings.sentry_error_sample_rate,
         "send_default_pii": settings.error_monitoring_send_default_pii,
@@ -393,6 +404,266 @@ def scrub_event(event: dict[str, Any], _: dict[str, Any]) -> dict[str, Any] | No
         return None
 
     return sanitized
+
+
+def capture_request_validation(
+    request: Request,
+    first_loc: str,
+    first_type: str,
+    error_count: int,
+) -> None:
+    """Capture a FastAPI Pydantic request-validation failure (HTTP 422).
+
+    ct-1841: 422s used to be invisible to us in production because FastAPI's
+    default RequestValidationError handler returns the response directly
+    without raising, and 422 is not in `_CAPTURED_CLIENT_REJECTION_CODES`.
+    A dedicated capture handler routes these into Sentry as warning-level
+    events tagged with the first failing field loc and Pydantic error type.
+
+    Privacy: the caller MUST sanitize the Pydantic error list with
+    `_sanitize_pydantic_errors` before invoking this so raw user content
+    from `input` is never shipped to Sentry.
+    """
+    if not is_error_monitoring_active():
+        return
+
+    context = build_monitoring_context(
+        request=request,
+        status_code=422,
+        event_kind="request_validation",
+    )
+    context["tags"]["error_kind"] = "request_validation"
+    if first_loc:
+        context["tags"]["first_field_loc"] = first_loc
+    if first_type:
+        context["tags"]["first_field_type"] = first_type
+    context["tags"]["error_count"] = str(error_count)
+    message = (
+        f"RequestValidationError on {request.method} "
+        f"{context['request']['route']} ({error_count} field(s))"
+    )
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_message(message, level="warning"),
+    )
+
+
+def capture_sync_item_validation(
+    request: Request,
+    item_kind: str,
+    item_id: str | None,
+    loc: str,
+    pydantic_type: str,
+    error_code: str,
+) -> None:
+    """Capture a per-entry validation failure surfaced through SyncItemError.
+
+    ct-1841: per-entry failures never propagate as exceptions because the
+    handler collects them into item_errors[] and returns 200. Sentry would
+    miss them entirely without this explicit capture. ENTRY_UNKNOWN_VALIDATION
+    is the most operationally interesting code; we ship `pydantic_type` as a
+    tag so we can promote new mappings into the classifier.
+    """
+    if not is_error_monitoring_active():
+        return
+
+    context = build_monitoring_context(
+        request=request,
+        status_code=200,
+        event_kind="sync_item_validation",
+    )
+    context["tags"]["error_kind"] = "sync_item_validation"
+    context["tags"]["error_code"] = error_code
+    context["tags"]["item_kind"] = item_kind
+    if pydantic_type:
+        context["tags"]["pydantic_type"] = pydantic_type
+    if loc:
+        context["tags"]["first_field_loc"] = loc
+    if item_id:
+        context["tags"]["item_id"] = item_id
+    message = (
+        f"sync_item_validation: {error_code} ({pydantic_type}) at {loc}"
+    )
+    # Only ENTRY_UNKNOWN_VALIDATION reaches warning level; expected codes
+    # (ENTRY_TOO_LARGE, ENTRY_MISSING_FIELD, ENTRY_INVALID_FIELD, etc.) emit
+    # info-level events so triage alerts focus on the truly novel failures.
+    if error_code == "ENTRY_UNKNOWN_VALIDATION":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="warning"),
+        )
+    else:
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="info"),
+        )
+
+
+def capture_response_validation(
+    request: Request,
+    first_loc: str,
+    first_type: str,
+    error_count: int,
+) -> None:
+    """Capture a FastAPI Pydantic response-validation failure.
+
+    A response-shape mismatch is a server bug, not a client one, so we send
+    it as a Sentry **error** (vs warning for request-side validation).
+    """
+    if not is_error_monitoring_active():
+        return
+
+    context = build_monitoring_context(
+        request=request,
+        status_code=500,
+        event_kind="response_validation",
+    )
+    context["tags"]["error_kind"] = "response_validation"
+    if first_loc:
+        context["tags"]["first_field_loc"] = first_loc
+    if first_type:
+        context["tags"]["first_field_type"] = first_type
+    context["tags"]["error_count"] = str(error_count)
+    message = (
+        f"ResponseValidationError on {request.method} "
+        f"{context['request']['route']} ({error_count} field(s))"
+    )
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_message(message, level="error"),
+    )
+
+
+SentryMessageLevel = Literal["fatal", "critical", "error", "warning", "info", "debug"]
+
+
+def capture_handled_operational_response(
+    request: Request,
+    status_code: int,
+    error_kind: str,
+    extra_tags: dict[str, str] | None = None,
+    *,
+    level: SentryMessageLevel = "warning",
+) -> None:
+    """Capture a known-operational handled response that the global 4xx
+    whitelist would normally miss.
+
+    Use this for specific, named situations we want visible in Sentry but
+    that don't belong in `_CAPTURED_CLIENT_REJECTION_CODES` (which would
+    drown Sentry in expected client noise). Examples: invalid
+    Content-Length headers (operational/probe traffic at 400), sync
+    invariant guards (handler-side 422 like entries_sent mismatch),
+    server-state idempotency conflicts (409 for storms / replay attacks),
+    operational 410 indicating unexpected stored-state loss.
+
+    Do NOT use this for ordinary user mistakes, expired-link 410s, auth
+    denials, or routine 404s. The rule of thumb: Sentry should get server
+    bugs, operational invariants, replay storms, and abuse/probe anomalies.
+
+    ct-1841 follow-up (unit-7 audit).
+    """
+    if not is_error_monitoring_active():
+        return
+
+    context = build_monitoring_context(
+        request=request,
+        status_code=status_code,
+        event_kind="handled_operational_response",
+    )
+    context["tags"]["error_kind"] = error_kind
+    for key, value in (extra_tags or {}).items():
+        context["tags"][key] = value
+    message = (
+        f"Handled operational {status_code} for {request.method} "
+        f"{context['request']['route']}: {error_kind}"
+    )
+    # ct-1841 unit-7 iter-02 W2: level is configurable so future adopters
+    # (info-level 410s, error-level operational invariants) can route to
+    # the right severity without forking the helper.
+    if level == "fatal":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="fatal"),
+        )
+    elif level == "critical":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="critical"),
+        )
+    elif level == "error":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="error"),
+        )
+    elif level == "info":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="info"),
+        )
+    elif level == "debug":
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="debug"),
+        )
+    else:
+        _capture_with_scope(
+            context=context,
+            capture=lambda: sentry_sdk.capture_message(message, level="warning"),
+        )
+
+
+def capture_background_exception(
+    exc: Exception,
+    *,
+    job: str,
+    phase: str,
+) -> None:
+    """Capture an unhandled exception from a background scheduler task.
+
+    Scheduler loops in main.py (`_purge_scheduler_loop`,
+    `_auth_email_outbox_scheduler_loop`) catch broad `Exception` and only
+    `logger.error(..., exc_info=True)`. Those failures never traverse the
+    request middleware so the existing Sentry hook never sees them. This
+    helper is the missing capture path: a Sentry error tagged with the
+    job + phase identifiers so operators can correlate scheduler outages
+    across deploys.
+
+    ct-1841 follow-up (unit-7 audit).
+    """
+    if not is_error_monitoring_active():
+        return
+
+    fingerprint = ["background_task_exception", job, phase]
+    request_context: dict[str, Any] = {
+        "job": job,
+        "phase": phase,
+    }
+    tags: dict[str, str] = {
+        "event_kind": "background_task_exception",
+        "job": job,
+        "phase": phase,
+    }
+    context = {
+        "fingerprint": fingerprint,
+        "request": request_context,
+        "tags": tags,
+    }
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_exception(exc),
+    )
+
+
+def sanitize_pydantic_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the `input` field from Pydantic error dicts before exposing them.
+
+    Pydantic embeds the offending raw value in `input`, which for sync entries
+    can be transcript content. Returning it in 422 bodies or shipping it to
+    Sentry would leak user content. Keep `type`, `loc`, `msg`, `ctx`; drop
+    `input`. Mirror of `routers.sync._sanitize_pydantic_errors` for callers
+    that don't already import the sync module.
+    """
+    return [{k: v for k, v in err.items() if k != "input"} for err in errors]
 
 
 # Middleware-generated 4xx codes we want visible in Sentry as warnings.

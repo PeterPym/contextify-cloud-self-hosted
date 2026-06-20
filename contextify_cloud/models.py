@@ -90,6 +90,13 @@ class Tenant(Base):
     is_internal: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"),
     )
+    # ct-2107: fire-once marker for the second_device_sync activation North-Star.
+    # Set exactly once (NULL -> timestamp) when a tenant's 2nd distinct device
+    # completes its first sync, claimed atomically under a per-tenant advisory lock
+    # in the sync router so concurrent first-syncs neither double-fire nor miss.
+    second_device_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     users: Mapped[list["User"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
@@ -900,4 +907,121 @@ class DeviceAuthorization(Base):
         Index("idx_device_auth_user_code_hash", "user_code_hash", unique=True),
         Index("idx_device_auth_device_code_hash", "device_code_hash", unique=True),
         Index("idx_device_auth_expires", "expires_at"),
+    )
+
+
+class License(Base):
+    """A purchased Local Commercial license (ct-1966).
+
+    One row per Stripe subscription. Holds the minted offline token so the buyer
+    can re-retrieve it, the optional association to a Cloud tenant when the buyer
+    was logged in at checkout (NULL for an anonymous, email-only purchase), and
+    the seats/expiry/status the purchase webhook keeps in sync with Stripe. The
+    token is verified offline by the native clients; this row is the record of
+    sale and the retrieval source, not an access gate.
+    """
+
+    __tablename__ = "licenses"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # The license_id claim embedded in the signed token; the stable external id.
+    license_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    product: Mapped[str] = mapped_column(
+        Text, nullable=False, default="local_commercial",
+        server_default="local_commercial",
+    )
+    customer_email: Mapped[str] = mapped_column(Text, nullable=False)
+    # Optional association to a Cloud tenant when the buyer logged in at checkout;
+    # NULL for an anonymous, email-only purchase. Unconstrained on purpose so a
+    # license outlives any tenant lifecycle change.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    stripe_customer_id: Mapped[str | None] = mapped_column(Text)
+    # The Stripe subscription is the one-row-per-purchase idempotency key, so it
+    # is required (a NULL would not be deduped by the unique constraint).
+    stripe_subscription_id: Mapped[str] = mapped_column(
+        Text, nullable=False, unique=True
+    )
+    # Signing key id the token was minted with (e.g. "lc1").
+    kid: Mapped[str] = mapped_column(Text, nullable=False)
+    seats: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="active", server_default="active",
+    )
+    # The signed offline token blob; re-minted on each invoice.paid renewal.
+    token: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Delivery-outbox state for the initial purchase-fulfillment email (ct-2015).
+    # Mirrors AuthToken's delivery columns. The fulfillment webhook enqueues a row
+    # with status 'pending' in the same transaction as the insert; a post-commit
+    # fast-path send marks it 'sent', and a background worker retries any row left
+    # 'pending'/'failed'. server_default 'sent' so pre-ct-2015 rows are never re-sent.
+    delivery_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="sent", server_default="sent"
+    )
+    delivery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_last_error: Mapped[str | None] = mapped_column(Text)
+    delivery_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(UTC), server_default=text("now()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC),
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint("seats >= 1", name="ck_licenses_seats_positive"),
+        CheckConstraint(
+            "delivery_status IN ('pending', 'sent', 'failed', 'exhausted')",
+            name="ck_licenses_delivery_status",
+        ),
+        # Case-insensitive retrieval by email (buyers may re-enter a different case).
+        Index("idx_licenses_customer_email_lower", text("lower(customer_email)")),
+        Index("idx_licenses_tenant", "tenant_id"),
+        # Retry sweep: due deliveries by status + next-attempt time.
+        Index(
+            "idx_licenses_delivery_retry",
+            "delivery_status",
+            "delivery_next_attempt_at",
+        ),
+    )
+
+
+class LicenseRetrievalToken(Base):
+    """Short-lived, single-use token for anonymous license retrieval (ct-2015).
+
+    A buyer with no Cloud account requests retrieval by their purchase email; if a
+    license exists, this hashed token is minted and a link is emailed. The token
+    is keyed only to the normalized email, expires quickly, and is consumed on
+    reveal. It grants nothing but a view of the license(s) for that exact email.
+    """
+
+    __tablename__ = "license_retrieval_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    email_normalized: Mapped[str] = mapped_column(Text, nullable=False)
+    # sha256 of the raw token; the raw value lives only in the emailed link.
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        # Cooldown lookup (recent unconsumed token for an email) + cleanup.
+        Index("idx_license_retrieval_tokens_email", text("lower(email_normalized)")),
+        Index("idx_license_retrieval_tokens_expires", "expires_at"),
     )

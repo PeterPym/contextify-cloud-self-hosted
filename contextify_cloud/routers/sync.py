@@ -6,12 +6,13 @@ import logging
 import random
 import re
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi import Request as HttpRequest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,12 +29,16 @@ from contextify_cloud.schemas import (
     PullProject,
     PullSummary,
     PullTranscript,
+    SyncEntry,
+    SyncItemError,
     SyncPullResponse,
     SyncPushRequest,
     SyncPushResponse,
     SyncStatusResponse,
 )
 from contextify_cloud.services.audit import log_event
+from contextify_cloud.services.funnel_events import emit_funnel_event, funnel_backend_registered
+from contextify_cloud.services.operator_notifications import notify_first_activation
 from contextify_cloud.services.plan_limits import (
     RETENTION_BATCH_SIZE,
     get_effective_history_retention_days,
@@ -50,6 +55,7 @@ from contextify_cloud.services.sync_status import (
 from contextify_cloud.services.tenant import ensure_tenant_schema_compat, get_tenant_schema
 from contextify_cloud.services.tenant_guard import check_tenant_active
 from contextify_cloud.services.user_scoping import build_user_scope_clause
+from contextify_cloud.sync_partial_accept import PartialAcceptSpec, validate_items
 
 logger = logging.getLogger(__name__)
 
@@ -58,25 +64,188 @@ _SCHEMA_NAME_RE = re.compile(r"^tenant_[a-z0-9_]+$")
 router = APIRouter(prefix="/api/v1/sync", tags=["sync"])
 
 
+# ct-1841: Per-entry partial-accept constants & helpers.
+#
+# The push body cap (`max_request_body_bytes`, default 50 MB) sets the
+# transport ceiling. The per-entry materialized ceiling sits well below that
+# so JSON quoting overhead + sibling entries in the same batch still fit.
+_MATERIALIZED_BYTE_CEILING = 32 * 1024 * 1024  # 32 MB per entry
+
+# Stable client-facing error codes routed through SyncItemError.error_code.
+# Adding a new code is forward-compatible: clients route on `retryable`, not
+# on the code identity, and unknown codes fall through to a generic handler.
+_PYDANTIC_TYPE_TO_CODE: dict[str, str] = {
+    "string_too_long": "ENTRY_TOO_LARGE",
+    "missing": "ENTRY_MISSING_FIELD",
+    "value_error": "ENTRY_INVALID_FIELD",
+    "string_type": "ENTRY_INVALID_FIELD",
+    "int_type": "ENTRY_INVALID_FIELD",
+    "bool_type": "ENTRY_INVALID_FIELD",
+    "list_type": "ENTRY_INVALID_FIELD",
+    "dict_type": "ENTRY_INVALID_FIELD",
+    "string_pattern_mismatch": "ENTRY_INVALID_FIELD",
+    "string_too_short": "ENTRY_INVALID_FIELD",
+    "too_short": "ENTRY_INVALID_FIELD",
+    "too_long": "ENTRY_TOO_LARGE",
+}
+
+
+def _classify_pydantic_error(pydantic_type: str) -> str:
+    """Map a Pydantic error type string to a stable client-facing error code.
+
+    Unknown types collapse to ENTRY_UNKNOWN_VALIDATION so previously unseen
+    failures still quarantine cleanly without poisoning the batch. The raw
+    `pydantic_type` rides along in the SyncItemError for triage so we can
+    promote new mappings in follow-up changes.
+    """
+    return _PYDANTIC_TYPE_TO_CODE.get(pydantic_type, "ENTRY_UNKNOWN_VALIDATION")
+
+
+def _extract_entry_id(raw: Any) -> str | None:
+    """Return the `id` field of a raw entry dict, or None when missing."""
+    if isinstance(raw, dict):
+        candidate = raw.get("id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _build_entry_partial_accept_spec(
+    capture: Callable[..., None] | None,
+) -> PartialAcceptSpec[SyncEntry]:
+    """ct-1841 unit-6 extraction: package the per-entry partial-accept
+    contract as a `PartialAcceptSpec` so the same mechanics can be
+    applied to other item kinds (projects, transcripts, summaries, etc.)
+    in follow-up phases. The Sentry capture is parameterized so tests
+    can opt out of monitoring side effects."""
+    return PartialAcceptSpec[SyncEntry](
+        item_kind="entry",
+        item_model=SyncEntry,
+        classifier=_classify_pydantic_error,
+        extract_item_id=_extract_entry_id,
+        capture_validation_error=capture,
+        array_key="entries",
+    )
+
+
+def _sanitize_pydantic_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the `input` field from Pydantic error dicts before exposing them.
+
+    Pydantic embeds the offending raw value in `input`, which for sync entries
+    can be transcript content. Returning it in 422 bodies or shipping it to
+    Sentry leaks user content. Keep `type`, `loc`, `msg`, `ctx` (and other
+    metadata) but drop `input`.
+    """
+    return [{k: v for k, v in err.items() if k != "input"} for err in errors]
+
+
+def _summarize_loc(loc: list[str | int] | tuple[Any, ...]) -> str:
+    return ".".join(str(part) for part in loc)
+
+
+def _jsonable(item: Any) -> Any:
+    """Return a JSON-serializable representation of a payload item.
+
+    Used by `_compute_request_sha256` so the request-hash computation works
+    uniformly across typed Pydantic models and raw dicts. `entries[]` arrives
+    as raw dicts after ct-1841; the other arrays stay typed. A single helper
+    keeps the canonical hash stable regardless of which array is which.
+    """
+    if isinstance(item, BaseModel):
+        return item.model_dump(mode="json")
+    return item
+
+
 def _compute_request_sha256(request: SyncPushRequest) -> str:
     """Compute a stable SHA-256 hash of the request payload for idempotency checks.
 
     Uses a canonical JSON representation of the data-bearing fields (excludes
     idempotency_key itself and batch_seq from the hash).
     """
-    # Build a canonical dict of data fields only
     canonical = {
         "device": request.device.model_dump(mode="json"),
-        "projects": [p.model_dump(mode="json") for p in request.projects],
-        "transcripts": [t.model_dump(mode="json") for t in request.transcripts],
-        "entries": [e.model_dump(mode="json") for e in request.entries],
-        "summaries": [s.model_dump(mode="json") for s in request.summaries],
-        "usage": [u.model_dump(mode="json") for u in request.usage],
-        "tool_invocations": [t.model_dump(mode="json") for t in request.tool_invocations],
-        "transcript_metadata": [m.model_dump(mode="json") for m in request.transcript_metadata],
+        "projects": [_jsonable(p) for p in request.projects],
+        "transcripts": [_jsonable(t) for t in request.transcripts],
+        "entries": [_jsonable(e) for e in request.entries],
+        "summaries": [_jsonable(s) for s in request.summaries],
+        "usage": [_jsonable(u) for u in request.usage],
+        "tool_invocations": [_jsonable(t) for t in request.tool_invocations],
+        "transcript_metadata": [_jsonable(m) for m in request.transcript_metadata],
     }
     serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _verify_entry_size_and_sha(
+    entry: SyncEntry,
+    index: int,
+) -> SyncItemError | None:
+    """Post-Pydantic, entry-specific checks: byte caps + sha verify.
+
+    Sits outside the generic `validate_items` helper because the per-chunk
+    transport cap (`1 MB` inline), per-entry materialized ceiling (32 MB),
+    and `content_sha256` invariant are all sync-domain semantics, not
+    framework boilerplate. Returns None on success or a `SyncItemError`
+    to route into `item_errors`.
+
+    Order matters: inline >1MB surfaces as a distinct ENTRY_TOO_LARGE
+    pointing at `content`, so the client can recognise the suggested fix
+    is to chunk; bigger materialized overflows point at the entry
+    boundary; sha mismatch is data-integrity rather than size.
+    """
+    # Inline byte cap (transport rule: inline must be <= 1 MB; clients
+    # exceeding this are expected to use content_chunks). The Pydantic
+    # validator allows arbitrary inline content; we recheck here so the
+    # failure carries the ENTRY_TOO_LARGE code instead of the generic
+    # ENTRY_INVALID_FIELD a Pydantic value_error would yield.
+    if entry.content is not None:
+        inline_bytes = len(entry.content.encode("utf-8"))
+        if inline_bytes > 1_000_000:
+            return SyncItemError(
+                item_kind="entry",
+                index=index,
+                item_id=entry.id,
+                error_code="ENTRY_TOO_LARGE",
+                retryable=False,
+                detail=(
+                    f"inline `content` is {inline_bytes} bytes; clients must use "
+                    "`content_chunks` for entries over 1,000,000 UTF-8 bytes"
+                ),
+                pydantic_type="string_too_long",
+                loc=["body", "entries", index, "content"],
+            )
+
+    materialized = entry.materialized_content()
+    materialized_bytes = materialized.encode("utf-8")
+    if len(materialized_bytes) > _MATERIALIZED_BYTE_CEILING:
+        return SyncItemError(
+            item_kind="entry",
+            index=index,
+            item_id=entry.id,
+            error_code="ENTRY_TOO_LARGE",
+            retryable=False,
+            detail=(
+                f"materialized content {len(materialized_bytes)} bytes exceeds "
+                f"ceiling {_MATERIALIZED_BYTE_CEILING}"
+            ),
+            pydantic_type=None,
+            loc=["body", "entries", index, "content"],
+        )
+
+    computed_sha = hashlib.sha256(materialized_bytes).hexdigest()
+    if computed_sha != entry.content_sha256:
+        return SyncItemError(
+            item_kind="entry",
+            index=index,
+            item_id=entry.id,
+            error_code="ENTRY_SHA_MISMATCH",
+            retryable=False,
+            detail="content_sha256 does not match materialized content",
+            pydantic_type=None,
+            loc=["body", "entries", index, "content_sha256"],
+        )
+
+    return None
 
 
 async def _rollback_savepoint(db: AsyncSession, sp: str) -> None:
@@ -245,6 +414,20 @@ async def sync_push(
             ),
         )
     if request.entries_sent is not None and request.entries_sent != len(request.entries):
+        # ct-1841 follow-up (unit-7 audit): this is a sync-invariant
+        # violation, not user input - a client should never emit it
+        # under normal operation. Surface to Sentry explicitly so
+        # operators can correlate client bugs across releases.
+        from contextify_cloud import monitoring as _monitoring
+        _monitoring.capture_handled_operational_response(
+            request=http_request,
+            status_code=422,
+            error_kind="entries_sent_mismatch",
+            extra_tags={
+                "declared": str(request.entries_sent),
+                "actual": str(len(request.entries)),
+            },
+        )
         raise HTTPException(
             status_code=422,
             detail=(
@@ -257,6 +440,63 @@ async def sync_push(
         if request.entries_sent is not None
         else len(request.entries)
     )
+
+    # ct-1841: per-entry validation MUST run before any downstream code touches
+    # entries (project allow-list, project_id remap, transcript remap, FK
+    # lookups). Downstream code reads typed attributes (entry.project_id,
+    # entry.id, entry.content_sha256); raw dicts would 500.
+    #
+    # The generic mechanics (try/except, SyncItemError construction,
+    # Sentry capture) live in `sync_partial_accept.validate_items`. The
+    # entry-specific size/sha checks live in `_verify_entry_size_and_sha`
+    # because those are sync-domain semantics, not framework boilerplate.
+    #
+    # Downstream code uses a local `entries: list[SyncEntry]` from here on;
+    # we don't mutate request.entries (which keeps its `list[dict[str, Any]]`
+    # type) so mypy can statically verify the rest of the handler.
+    from contextify_cloud import monitoring as _monitoring  # local import; avoids cycles
+
+    raw_entries: list[Any] = list(request.entries)
+    spec = _build_entry_partial_accept_spec(
+        capture=_monitoring.capture_sync_item_validation
+    )
+    helper_result = validate_items(
+        raw_items=raw_entries,
+        spec=spec,
+        request=http_request,
+    )
+    item_errors: list[SyncItemError] = list(helper_result.item_errors)
+    entries_permanent_failed = helper_result.permanent_failed
+
+    # Entry-specific post-validation: byte caps + sha verify. The helper
+    # already populated item_errors for Pydantic-level failures; this
+    # second pass handles size/sha rejections, which can't be expressed
+    # in Pydantic without sacrificing the ENTRY_TOO_LARGE vs
+    # ENTRY_INVALID_FIELD distinction.
+    entries: list[SyncEntry] = []
+    for entry in helper_result.valid_items:
+        original_index = helper_result.raw_index_by_item_id.get(entry.id)
+        if original_index is None:
+            # `id` may have been duplicated; recover by linear search.
+            original_index = next(
+                (i for i, r in enumerate(raw_entries)
+                 if isinstance(r, dict) and r.get("id") == entry.id),
+                0,
+            )
+        post_err = _verify_entry_size_and_sha(entry, original_index)
+        if post_err is not None:
+            item_errors.append(post_err)
+            entries_permanent_failed += 1
+            _monitoring.capture_sync_item_validation(
+                request=http_request,
+                item_kind="entry",
+                item_id=post_err.item_id,
+                loc=_summarize_loc(post_err.loc),
+                pydantic_type=post_err.pydantic_type or "",
+                error_code=post_err.error_code,
+            )
+            continue
+        entries.append(entry)
 
     # Resolve tenant schema
     tenant = await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
@@ -288,7 +528,13 @@ async def sync_push(
         )
     )
     device = device_result.scalar_one_or_none()
+    # ct-2106: track whether THIS device's last_sync_at was NULL before this
+    # request (a NULL->non-NULL first-sync transition). The UPDATEs below are raw
+    # SQL and do NOT mutate the loaded ORM object, so device.last_sync_at still
+    # holds the PRE-update value; capture the boolean BEFORE issuing each UPDATE.
+    device_was_first_sync = False
     if device:
+        device_was_first_sync = device.last_sync_at is None
         await db.execute(
             update(Device)
             .where(Device.id == device.id)
@@ -335,6 +581,8 @@ async def sync_push(
                 )
         if device is not None:
             # Device was created by a concurrent request after our initial check
+            # ct-2106: capture the pre-update first-sync transition here too.
+            device_was_first_sync = device.last_sync_at is None
             await db.execute(
                 update(Device)
                 .where(Device.id == device.id)
@@ -346,6 +594,8 @@ async def sync_push(
                 )
             )
         else:
+            # ct-2106: a brand-new device's first sync is always a first-sync.
+            device_was_first_sync = True
             device = Device(
                 user_id=auth.user_id,
                 machine_name=request.device.machine_name,
@@ -436,7 +686,7 @@ async def sync_push(
     # (prevents orphaned rows under allow-list policy).
     blocked_projects: list[str] = []
     blocked_project_ids: set[str] = set()
-    original_entry_count = len(request.entries)
+    original_entry_count = len(entries)
     allowlist = tenant_obj.project_allowlist
     if allowlist is not None:
         allowed_set = set(allowlist)
@@ -465,7 +715,7 @@ async def sync_push(
         # blindly blocking them.
         referenced_project_ids = (
             {t.project_id for t in request.transcripts}
-            | {e.project_id for e in request.entries}
+            | {e.project_id for e in entries}
             | {m.project_id for m in request.transcript_metadata}
         )
         missing_from_batch = referenced_project_ids - provided_project_ids
@@ -501,12 +751,12 @@ async def sync_push(
         request.transcripts = [
             t for t in request.transcripts if t.project_id in allowed_project_ids
         ]
-        request.entries = [e for e in request.entries if e.project_id in allowed_project_ids]
-        entries_blocked_policy = max(0, original_entry_count - len(request.entries))
+        entries = [e for e in entries if e.project_id in allowed_project_ids]
+        entries_blocked_policy = max(0, original_entry_count - len(entries))
         if entries_blocked_policy > 0:
             error_codes.add("ENTRY_POLICY_BLOCKED")
 
-        allowed_entry_ids = {e.id for e in request.entries}
+        allowed_entry_ids = {e.id for e in entries}
         allowed_transcript_ids = {t.id for t in request.transcripts}
         request.usage = [u for u in request.usage if u.entry_id in allowed_entry_ids]
         request.summaries = [s for s in request.summaries if s.entry_id in allowed_entry_ids]
@@ -696,7 +946,7 @@ async def sync_push(
         for tx in request.transcripts:
             if tx.project_id in project_id_remap:
                 tx.project_id = project_id_remap[tx.project_id]
-        for entry in request.entries:
+        for entry in entries:
             if entry.project_id in project_id_remap:
                 entry.project_id = project_id_remap[entry.project_id]
         for meta in request.transcript_metadata:
@@ -764,7 +1014,7 @@ async def sync_push(
             errors.append(f"Transcript {tx.id}: {e}")
 
     if transcript_id_remap:
-        for entry in request.entries:
+        for entry in entries:
             if entry.transcript_id in transcript_id_remap:
                 entry.transcript_id = transcript_id_remap[entry.transcript_id]
         for inv in request.tool_invocations:
@@ -774,10 +1024,46 @@ async def sync_push(
             if meta.transcript_id in transcript_id_remap:
                 meta.transcript_id = transcript_id_remap[meta.transcript_id]
 
+    # ct-2028 (CL-S01): capture the entry high-water mark BEFORE inserting this
+    # request's entries. server_sequence is assigned monotonically by a
+    # server-side sequence on INSERT, so it is the only reliable server-arrival
+    # marker (created_at/timestamp are client-supplied and can predate the
+    # retention window for restores/backfills). Rows inserted in THIS request
+    # get server_sequence > pre_push_max_seq; the on-push retention cleanup
+    # below excludes them so just-pushed older-than-window history is never
+    # deleted in the same request it was accepted.
+    pre_push_max_seq = 0
+    # ct-2076: only trust a 0 watermark for first-activation detection when the
+    # read actually succeeded; the fail-safe below also yields 0.
+    pre_push_watermark_known = False
+    try:
+        # ct-2028 (review iter-01): run the watermark read inside a SAVEPOINT so a
+        # statement failure rolls back only the nested transaction. On PostgreSQL
+        # a failed statement aborts the WHOLE transaction (InFailedSQLTransaction)
+        # and poisons the session; without the savepoint the subsequent entry
+        # inserts / retention / audit logging / idempotency update would all fail.
+        async with db.begin_nested():
+            pre_push_seq_result = await db.execute(
+                text(f"SELECT COALESCE(MAX(server_sequence), 0) FROM {schema}.transcript_entries")
+            )
+            pre_push_max_seq = pre_push_seq_result.scalar() or 0
+        pre_push_watermark_known = True
+    except Exception:
+        # If we cannot read the high-water mark, fail safe: a 0 watermark means
+        # the retention DELETE below matches no rows (server_sequence is NOT
+        # NULL and always >= 1), so we never delete rather than risk deleting
+        # just-pushed history. The savepoint above keeps the outer transaction
+        # usable so the rest of the push still completes.
+        logger.warning(
+            "Pre-push retention watermark unavailable; skipping retention eligibility",
+            exc_info=True,
+        )
+        pre_push_max_seq = 0
+
     # Upsert entries (deduplicate by ID only) -- bulk two-phase approach
     # Phase 1: Batch duplicate/conflict check
-    if request.entries:
-        entry_ids = [e.id for e in request.entries]
+    if entries:
+        entry_ids = [e.id for e in entries]
         # Build parameterized IN clause for batch lookup
         id_params = {f"eid_{i}": eid for i, eid in enumerate(entry_ids)}
         id_placeholders = ", ".join(f":eid_{i}" for i in range(len(entry_ids)))
@@ -791,15 +1077,18 @@ async def sync_push(
         existing_map = {row.id: row.content_sha256 for row in existing_result}
 
         # Classify: new entries vs duplicates vs conflicts
-        new_entries = []
-        for entry in request.entries:
+        new_entries: list[SyncEntry] = []
+        for entry in entries:
             if entry.id in existing_map:
                 if existing_map[entry.id] == entry.content_sha256:
                     # Same ID, same content: idempotent duplicate
                     duplicates += 1
                     entries_duplicates += 1
                 else:
-                    # Same ID, different content: conflict error
+                    # Same ID, different content: conflict error.
+                    # ct-1841: also surface in item_errors so the client can
+                    # quarantine this row by id without parsing the legacy
+                    # `errors[]` strings.
                     entries_conflicted += 1
                     error_codes.add("ENTRY_CONFLICT")
                     errors.append(
@@ -807,6 +1096,17 @@ async def sync_push(
                         f"(existing sha: {existing_map[entry.id][:16]}..., "
                         f"new sha: {entry.content_sha256[:16]}...)"
                     )
+                    item_errors.append(SyncItemError(
+                        item_kind="entry",
+                        item_id=entry.id,
+                        error_code="ENTRY_CONFLICT",
+                        retryable=False,
+                        detail=(
+                            f"entry exists with different content "
+                            f"(existing sha {existing_map[entry.id][:16]}..., "
+                            f"new sha {entry.content_sha256[:16]}...)"
+                        ),
+                    ))
             else:
                 new_entries.append(entry)
 
@@ -850,7 +1150,11 @@ async def sync_push(
                             f"provider{suffix}": entry.provider,
                             f"kind{suffix}": entry.kind,
                             f"timestamp{suffix}": entry.timestamp,
-                            f"content{suffix}": entry.content,
+                            # ct-1841: chunked entries arrive with `content` unset
+                            # and content split into `content_chunks`. Materialize
+                            # back to a single string here so the INSERT sees one
+                            # logical row regardless of the transport shape.
+                            f"content{suffix}": entry.materialized_content(),
                             f"content_sha256{suffix}": entry.content_sha256,
                             f"display_in_timeline{suffix}": entry.display_in_timeline,
                             f"git_branch{suffix}": entry.git_branch,
@@ -1021,6 +1325,16 @@ async def sync_push(
     # If the tenant has a data retention policy (> 0 days), delete entries
     # older than the retention window. This is opportunistic cleanup on push
     # rather than a background job.
+    #
+    # ct-2028 (CL-S01): only consider rows that were already resident on the
+    # server BEFORE this request (server_sequence <= pre_push_max_seq). Entries
+    # inserted in THIS push get a higher server_sequence and must NOT be deleted
+    # in the same request, even when their client timestamp predates the window
+    # (DB restore, late first sync, backfill of newly-discovered old
+    # transcripts). The cloud is the source of truth; deleting just-pushed
+    # history would silently lose data for any device that has not pulled yet.
+    # Genuinely-resident truly-old rows (server_sequence <= pre_push_max_seq)
+    # are still removed, so retention semantics are preserved.
     retention_days = get_effective_history_retention_days(tenant_obj)
     if retention_days > 0:
         retention_cutoff = int(
@@ -1028,20 +1342,31 @@ async def sync_push(
             .timestamp()
         )
         try:
-            cleanup_result = await db.execute(
-                text(
-                    f"WITH rows AS ("
-                    f"  SELECT ctid FROM {schema}.transcript_entries "
-                    f"  WHERE timestamp < :cutoff "
-                    f"  ORDER BY timestamp ASC "
-                    f"  LIMIT :batch_size"
-                    f") "
-                    f"DELETE FROM {schema}.transcript_entries "
-                    f"WHERE ctid IN (SELECT ctid FROM rows)"
-                ),
-                {"cutoff": retention_cutoff, "batch_size": RETENTION_BATCH_SIZE},
-            )
-            cleaned_count = cleanup_result.rowcount  # type: ignore[attr-defined]
+            # ct-2028 (review iter-01): run the retention DELETE inside a SAVEPOINT
+            # so a statement failure rolls back only the nested transaction. On
+            # PostgreSQL a failed DELETE would otherwise abort the whole outer
+            # transaction, poisoning the session and breaking the high-water mark
+            # read, audit logging, and idempotency update that follow.
+            async with db.begin_nested():
+                cleanup_result = await db.execute(
+                    text(
+                        f"WITH rows AS ("
+                        f"  SELECT ctid FROM {schema}.transcript_entries "
+                        f"  WHERE timestamp < :cutoff "
+                        f"    AND server_sequence <= :pre_push_max_seq "
+                        f"  ORDER BY timestamp ASC "
+                        f"  LIMIT :batch_size"
+                        f") "
+                        f"DELETE FROM {schema}.transcript_entries "
+                        f"WHERE ctid IN (SELECT ctid FROM rows)"
+                    ),
+                    {
+                        "cutoff": retention_cutoff,
+                        "batch_size": RETENTION_BATCH_SIZE,
+                        "pre_push_max_seq": pre_push_max_seq,
+                    },
+                )
+                cleaned_count = cleanup_result.rowcount  # type: ignore[attr-defined]
             if cleaned_count > 0:
                 logger.info(
                     "Data retention cleanup: deleted %d entries older than %d days "
@@ -1067,6 +1392,21 @@ async def sync_push(
         server_sequence = max_result.scalar() or 0
     except Exception:
         pass
+
+    # ct-2076: detect first activation and resolve the user's email HERE, while
+    # trailing writes (usage event, session completion, idempotency store) still
+    # follow. Doing the lookup now keeps this SELECT from becoming the handler's
+    # final statement, which the session-completion path asserts on. The
+    # notification itself (no DB work) fires near the return.
+    is_first_activation = (
+        pre_push_watermark_known and pre_push_max_seq == 0 and entries_accepted > 0
+    )
+    activation_email: str | None = None
+    if is_first_activation:
+        activation_email_result = await db.execute(
+            select(User.email).where(User.id == auth.user_id)
+        )
+        activation_email = activation_email_result.scalar_one_or_none()
 
     # Record usage event
     usage_event = UsageEvent(
@@ -1117,11 +1457,18 @@ async def sync_push(
         + entries_duplicates
         + entries_conflicted
         + entries_blocked_policy
+        + entries_permanent_failed  # ct-1841: permanent failures count as resolved
     )
     checkpoint_safe = (
         entries_retriable_failed == 0 and entries_resolved == entries_sent_total
     )
-    needs_attention_count = entries_conflicted + entries_blocked_policy
+    # ct-1841: permanent failures (oversized, sha mismatch, malformed) bubble
+    # up as needs_attention so the client surfaces them in the skipped-entries
+    # row, but they do NOT mark the batch `blocked` -- only retriable failures
+    # block. Permanent-only batches resolve as `completed_with_issues`.
+    needs_attention_count = (
+        entries_conflicted + entries_blocked_policy + entries_permanent_failed
+    )
     completion_state: Literal["in_progress", "success", "completed_with_issues", "blocked"]
     if entries_retriable_failed > 0:
         completion_state = "blocked"
@@ -1215,10 +1562,16 @@ async def sync_push(
             )
             sync_session_id = None
 
+    # ct-1841: surface every permanent item failure in item_errors[]. Each
+    # entry's error_code carries forward to client-side error_codes set so
+    # legacy clients can still see "ENTRY_TOO_LARGE", etc.
+    for ie in item_errors:
+        error_codes.add(ie.error_code)
+
     response = SyncPushResponse(
         accepted=accepted,
         duplicates_skipped=duplicates,
-        errors=errors[:10],  # Cap error messages to avoid oversized responses
+        errors=errors[:10],  # Cap human-readable error strings to avoid oversized responses
         sync_token=str(uuid.uuid4()),
         idempotency_key=request.idempotency_key,
         sync_session_id=sync_session_id,
@@ -1228,12 +1581,14 @@ async def sync_push(
         entries_duplicates=entries_duplicates,
         entries_conflicted=entries_conflicted,
         entries_blocked_policy=entries_blocked_policy,
+        entries_permanent_failed=entries_permanent_failed,
         entries_retriable_failed=entries_retriable_failed,
         entries_resolved=entries_resolved,
         checkpoint_safe=checkpoint_safe,
         completion_state=completion_state,
         needs_attention_count=needs_attention_count,
         error_codes=sorted(error_codes),
+        item_errors=item_errors,
         server_sequence=server_sequence,
         project_id_remapped=project_id_remap,
     )
@@ -1290,6 +1645,115 @@ async def sync_push(
                 logger.info("Stale session cleanup: abandoned %d sessions", stale_cleaned)
         except Exception:
             logger.debug("Stale session cleanup skipped (non-critical)", exc_info=True)
+
+    # ct-2076: fire the first-successful-sync (activation) operator notification.
+    # Fires once, when a tenant that had NO entries (confirmed-empty watermark)
+    # lands its first ones - the activation signal error monitoring cannot see,
+    # and it auto-pings when a previously-stuck user (e.g. a legacy client that
+    # finally drains after the cap raise) activates. Idempotent replays return
+    # earlier and never reach here, so it does not double-fire. The email lookup
+    # ran earlier, so this adds no trailing DB query (fire-and-forget).
+    if is_first_activation:
+        await notify_first_activation(
+            email=activation_email, tenant_id=str(auth.tenant_id)
+        )
+        # ct-2080: funnel event (no-op unless hosted backend registered).
+        await emit_funnel_event(
+            "first_sync",
+            distinct_id=str(auth.tenant_id),
+            properties={"entries_accepted": entries_accepted},
+        )
+
+    # ct-2106 + ct-2107: second_device_sync, the real ct-1460 activation North-Star.
+    # Emits once when a 2nd DISTINCT device for the tenant completes its first sync
+    # within 14 days of register. device_was_first_sync gates on THIS device's
+    # NULL->non-NULL last_sync_at transition.
+    #
+    # ct-2107 hardening (previously a tracked follow-up): the emission is now
+    # transactional fire-once, not best-effort. A per-tenant BLOCKING advisory lock
+    # serializes concurrent first-syncs for the same tenant so the synced-device count
+    # is read accurately (kills the under-read MISS, where two devices on a zero-synced
+    # tenant each observe a count of 1 and the event is dropped), and a persisted marker
+    # (tenants.second_device_synced_at) claimed atomically via UPDATE ... WHERE marker
+    # IS NULL RETURNING fires the event exactly once (kills the over-read DUPLICATE and
+    # any replay double-fire). The count uses >= 2 so a historically-under-read tenant
+    # now at 3+ synced devices still activates once; the marker prevents the 3rd/4th
+    # device from re-firing.
+    #
+    # The whole block is gated by funnel_backend_registered() so non-hosted builds pay
+    # nothing (no lock, no count, no UPDATE), runs only on the rare device-first-sync
+    # path (the common sync path never locks), and takes its lock AFTER the idempotency
+    # lock at the top of push (one consistent acquire order across all requests -> no
+    # deadlock).
+    #
+    # Failure isolation (ct-2107 review CT2107-P1-1): the DB portion runs inside a
+    # SAVEPOINT (begin_nested). A statement error in the lock/count/claim - e.g. a
+    # deploy-skew missing column, a lock timeout, or any operational error - would
+    # otherwise leave the OUTER sync transaction aborted, so merely catching the Python
+    # exception is not enough: the request would still 500 at commit. The savepoint
+    # confines any such failure, the outer transaction stays committable, and activation
+    # analytics genuinely cannot break a sync. emit_funnel_event is fire-and-forget and
+    # touches no DB, so it runs AFTER the savepoint, outside the failure boundary.
+    if device_was_first_sync and funnel_backend_registered():
+        event_payload: dict[str, Any] | None = None
+        try:
+            async with db.begin_nested():
+                tenant_lock_key = int(
+                    hashlib.sha256(
+                        f"second_device_sync:{auth.tenant_id}".encode()
+                    ).hexdigest()[:15],
+                    16,
+                )
+                await db.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": tenant_lock_key},
+                )
+                synced_device_count = (
+                    await db.execute(
+                        select(func.count(func.distinct(Device.id)))
+                        .select_from(Device)
+                        .join(User, User.id == Device.user_id)
+                        .where(
+                            User.tenant_id == auth.tenant_id,
+                            Device.last_sync_at.is_not(None),
+                        )
+                    )
+                ).scalar() or 0
+                if synced_device_count >= 2 and tenant_obj.created_at is not None:
+                    register_age = datetime.now(UTC) - tenant_obj.created_at
+                    if register_age <= timedelta(days=14):
+                        # Atomic fire-once claim: only the first request to flip the
+                        # marker NULL->now() wins and emits. public-qualified because the
+                        # request search_path may point at a tenant schema.
+                        claimed = (
+                            await db.execute(
+                                text(
+                                    "UPDATE public.tenants "
+                                    "SET second_device_synced_at = :now "
+                                    "WHERE id = :tid "
+                                    "AND second_device_synced_at IS NULL "
+                                    "RETURNING id"
+                                ),
+                                {"now": datetime.now(UTC), "tid": auth.tenant_id},
+                            )
+                        ).scalar()
+                        if claimed is not None:
+                            event_payload = {
+                                "device_count": synced_device_count,
+                                "days_since_register": register_age.days,
+                            }
+        except Exception:  # noqa: BLE001 - activation analytics must never break a sync
+            logger.warning(
+                "event=second_device_sync_hardening_failed tenant_id=%s",
+                auth.tenant_id,
+                exc_info=True,
+            )
+        if event_payload is not None:
+            await emit_funnel_event(
+                "second_device_sync",
+                distinct_id=str(auth.tenant_id),
+                properties=event_payload,
+            )
 
     return response
 

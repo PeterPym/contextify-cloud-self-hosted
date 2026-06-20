@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 # --- Auth ---
 
@@ -84,6 +84,10 @@ class SyncTranscript(BaseModel):
     updated_at: int
 
 
+_PER_CHUNK_BYTE_CAP = 1_000_000  # 1 MB UTF-8 bytes per chunk
+_MAX_CHUNKS_PER_ENTRY = 40        # 40 * 900 KB ~= 36 MB, below 50 MB body cap
+
+
 class SyncEntry(BaseModel):
     id: str
     transcript_id: str
@@ -92,7 +96,14 @@ class SyncEntry(BaseModel):
     provider: str
     kind: str = Field(..., pattern=r"^(user|assistant|system|summary)$")
     timestamp: int
-    content: str = Field(..., max_length=1_000_000)  # 1MB limit per entry
+    # ct-1841: content may be sent inline (`content`) or split into
+    # `content_chunks` for entries that exceed the per-chunk byte cap. Exactly
+    # one of the two fields must be set. The handler materializes chunks into
+    # a single TEXT row before INSERT and verifies content_sha256 against the
+    # materialized bytes. All limits are enforced as UTF-8 byte counts, not
+    # character counts.
+    content: str | None = Field(default=None)
+    content_chunks: list[str] | None = Field(default=None, max_length=_MAX_CHUNKS_PER_ENTRY)
     content_sha256: str = Field(
         ..., min_length=64, max_length=64,
     )  # SHA-256 = 64 hex chars
@@ -107,6 +118,34 @@ class SyncEntry(BaseModel):
     source_device_name: str | None = None
     created_at: int
     updated_at: int
+
+    @model_validator(mode="after")
+    def _content_xor_chunks(self) -> "SyncEntry":
+        # Exactly one of content / content_chunks must be set. This keeps the
+        # wire format unambiguous and lets the handler decide how to materialize.
+        # Per-chunk byte caps live here (defensive); per-entry materialized
+        # ceiling lives in the push handler so it can be enforced after
+        # reassembly and surfaced as ENTRY_TOO_LARGE in item_errors.
+        has_content = self.content is not None
+        has_chunks = self.content_chunks is not None
+        if has_content == has_chunks:
+            raise ValueError(
+                "exactly one of `content` or `content_chunks` must be set"
+            )
+        if has_chunks:
+            assert self.content_chunks is not None  # narrowing
+            for i, chunk in enumerate(self.content_chunks):
+                if len(chunk.encode("utf-8")) > _PER_CHUNK_BYTE_CAP:
+                    raise ValueError(
+                        f"`content_chunks[{i}]` exceeds 1 MB UTF-8 bytes"
+                    )
+        return self
+
+    def materialized_content(self) -> str:
+        """Return the single logical content string, joining chunks if needed."""
+        if self.content is not None:
+            return self.content
+        return "".join(self.content_chunks or [])
 
 
 class SyncSummary(BaseModel):
@@ -197,11 +236,43 @@ class SyncPushRequest(BaseModel):
     device: DeviceInfo
     projects: list[SyncProject] = Field(default_factory=list)
     transcripts: list[SyncTranscript] = Field(default_factory=list)
-    entries: list[SyncEntry] = Field(default_factory=list)
+    # ct-1841: entries arrive as raw dicts at the envelope so a single bad
+    # entry never 422s the whole batch. The push handler validates each entry
+    # with SyncEntry.model_validate inside a per-entry try/except, routing
+    # failures into structured item_errors with stable error_codes. Other
+    # arrays remain typed because downstream handler code reads typed
+    # attributes (summary.entry_id, usage.request_id, etc.).
+    entries: list[dict[str, Any]] = Field(default_factory=list)
     summaries: list[SyncSummary] = Field(default_factory=list)
     usage: list[SyncUsage] = Field(default_factory=list)
     tool_invocations: list[SyncToolInvocation] = Field(default_factory=list)
     transcript_metadata: list[SyncTranscriptMetadata] = Field(default_factory=list)
+
+
+class SyncItemError(BaseModel):
+    """Per-item error for ct-1841 partial-accept.
+
+    The push handler emits one entry per failed item (entry, summary, usage,
+    tool_invocation, transcript_metadata) instead of poisoning the whole batch.
+    Clients route on `retryable` regardless of whether they recognize the
+    `error_code`, so the contract stays forward-compatible.
+
+    Detail and pydantic_type are bounded so a pathological validation message
+    cannot create a large response or leak content-like values. The server
+    must construct `detail` from type + loc + sanitized constraint summary -
+    never raw user content from Pydantic `input`.
+    """
+
+    item_kind: Literal[
+        "entry", "summary", "usage", "tool_invocation", "transcript_metadata"
+    ]
+    index: int | None = None
+    item_id: str | None = None
+    error_code: str
+    retryable: bool
+    detail: str | None = Field(default=None, max_length=500)
+    pydantic_type: str | None = Field(default=None, max_length=128)
+    loc: list[str | int] = Field(default_factory=list)
 
 
 class SyncPushResponse(BaseModel):
@@ -217,6 +288,7 @@ class SyncPushResponse(BaseModel):
     entries_duplicates: int = 0
     entries_conflicted: int = 0
     entries_blocked_policy: int = 0
+    entries_permanent_failed: int = 0  # ct-1841: split from retriable
     entries_retriable_failed: int = 0
     entries_resolved: int = 0
     checkpoint_safe: bool = False
@@ -225,6 +297,10 @@ class SyncPushResponse(BaseModel):
     ] = "in_progress"
     needs_attention_count: int = 0
     error_codes: list[str] = Field(default_factory=list)
+    # ct-1841: structured per-item errors. Uncapped by count so clients can
+    # quarantine every failed entry. `errors[]` above remains the legacy
+    # human-readable summary, still capped at 10.
+    item_errors: list[SyncItemError] = Field(default_factory=list)
     server_sequence: int = 0
     project_id_remapped: dict[str, str] = Field(
         default_factory=dict,
@@ -271,7 +347,10 @@ class PullEntry(BaseModel):
     provider: str
     kind: str = Field(..., pattern=r"^(user|assistant|system|summary)$")
     timestamp: int
-    content: str = Field(..., max_length=1_000_000)
+    # ct-1841: cap removed so reassembled large content can round-trip back to
+    # clients. The push handler already enforces a materialized byte ceiling
+    # before insert, so unbounded values cannot reach the DB.
+    content: str
     content_sha256: str = Field(..., min_length=64, max_length=64)
     display_in_timeline: bool = True
     git_branch: str | None = None
@@ -332,6 +411,11 @@ class SearchResult(BaseModel):
     user_name: str | None = None
     user_email: str | None = None
     transcript_title: str | None = None
+    # ct-2250: True when the caller uploaded this entry. The server is authoritative on
+    # own-vs-teammate (the client cannot derive "self" from its transport-only config), so
+    # clients label provenance off this flag rather than guessing from the presence of a
+    # user_name (the team-widened response carries the caller's OWN rows too).
+    is_own: bool = False
 
 
 class SearchResponse(BaseModel):
@@ -389,6 +473,19 @@ class ProjectActivityResponse(BaseModel):
     has_more: bool = False
 
 
+class ProjectShareRequest(BaseModel):
+    """Toggle a project's team-read share state (ct-2250)."""
+
+    shared: bool
+
+
+class ProjectShareResponse(BaseModel):
+    """Result of a share toggle: the project's authoritative new share state."""
+
+    project_id: str
+    shared_with_team: bool
+
+
 # --- Billing ---
 
 
@@ -404,6 +501,18 @@ class CheckoutResponse(BaseModel):
     """Response with the Stripe Checkout session URL."""
 
     checkout_url: str
+
+
+class LocalCommercialCheckoutRequest(BaseModel):
+    """Request for the account-optional Local Commercial checkout (ct-1966)."""
+
+    price_id: str = Field(..., description="Stripe price ID for a Local Commercial plan")
+    success_url: str = Field(..., description="URL to redirect after successful payment")
+    cancel_url: str = Field(..., description="URL to redirect if checkout is cancelled")
+    customer_email: str | None = Field(
+        None,
+        description="Buyer email for an anonymous purchase (ignored when logged in)",
+    )
 
 
 class PortalResponse(BaseModel):
@@ -1057,4 +1166,39 @@ class TenantDeleteCancelResponse(BaseModel):
     """Response after cancelling a scheduled tenant deletion."""
 
     status: Literal["deletion_cancelled"]
+    message: str
+
+
+# --- Local Commercial license retrieval (ct-2015) ---
+
+
+class LicenseSummary(BaseModel):
+    """A Local Commercial license returned to its owner for re-retrieval.
+
+    Only fields the owner needs are exposed; internal columns (customer email,
+    Stripe ids, delivery state) are never included.
+    """
+
+    license_id: str
+    product: str
+    token: str
+    seats: int
+    status: str
+    expires_at: datetime
+
+
+class LicensesResponse(BaseModel):
+    licenses: list[LicenseSummary]
+
+
+class LicenseRetrievalRequest(BaseModel):
+    """Request an anonymous license-retrieval link by purchase email."""
+
+    email: EmailStr
+
+
+class LicenseRetrievalRequestResponse(BaseModel):
+    """Always the same shape whether or not a license exists (no enumeration)."""
+
+    status: Literal["ok"]
     message: str

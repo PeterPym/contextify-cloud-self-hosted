@@ -74,6 +74,18 @@ _TENANT_SCHEMA_COMPAT_SQL = (
         ON {schema}.projects(repo_group_key)
     """,
     """
+    CREATE TABLE IF NOT EXISTS {schema}.project_team_shares (
+        user_id UUID NOT NULL REFERENCES public.users(id),
+        project_id TEXT NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+        created_at BIGINT NOT NULL,
+        PRIMARY KEY (user_id, project_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_project_team_shares_project
+        ON {schema}.project_team_shares(project_id)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_projects_repo_identity
         ON {schema}.projects(repo_identity)
     """,
@@ -113,6 +125,22 @@ CREATE TABLE IF NOT EXISTS {schema}.projects (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
+
+-- ct-2250: PER-USER team-share consent. A row here means "this user shares THEIR OWN
+-- entries for this project with the team". Team-aware recall surfaces a teammate's row
+-- only if that teammate (the row's uploaded_by_user_id) has a share record here for the
+-- project. Each user controls only their own entries -- no one else's toggle touches your
+-- data -- so there is no co-contributor exposure, no discovery-surface requirement, and no
+-- viewer asymmetry. Default state is unshared (absence of a row). Un-share = DELETE the row.
+CREATE TABLE IF NOT EXISTS {schema}.project_team_shares (
+    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (user_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_team_shares_project
+    ON {schema}.project_team_shares(project_id);
 
 CREATE INDEX IF NOT EXISTS idx_projects_repo_group_key
     ON {schema}.projects(repo_group_key);

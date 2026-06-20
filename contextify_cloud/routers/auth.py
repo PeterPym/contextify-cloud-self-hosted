@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
@@ -42,6 +42,7 @@ from contextify_cloud.schemas import (
 )
 from contextify_cloud.services.audit import log_event
 from contextify_cloud.services.browser_handoff import issue_browser_handoff_token
+from contextify_cloud.services.funnel_events import emit_funnel_event
 from contextify_cloud.services.tenant import _sanitize_slug, provision_tenant
 from contextify_cloud.services.tenant_guard import check_tenant_active
 
@@ -412,6 +413,26 @@ async def revoke_api_key(
     )
 
     logger.info("Revoked API key key_id=%s by user=%s", key.key_id, auth.user_id)
+
+    # ct-2106: churn_signal only when this revoke leaves NO active keys, the user has
+    # fully disconnected all CLI access (strong disengagement). Rotations (revoke one
+    # of several, or revoke-then-recreate) keep >=1 active key and do NOT fire. The
+    # revoke UPDATE above ran in this same session, so this count sees revoked_at set
+    # on this key. No-op unless the hosted backend is registered.
+    remaining_active = (
+        await db.execute(
+            select(func.count(ApiKey.id)).where(
+                ApiKey.tenant_id == auth.tenant_id,
+                ApiKey.revoked_at.is_(None),
+            )
+        )
+    ).scalar() or 0
+    if remaining_active == 0:
+        await emit_funnel_event(
+            "churn_signal",
+            distinct_id=str(auth.tenant_id),
+            properties={"churn_kind": "key_revoke"},
+        )
 
 
 @router.put("/api-keys/{api_key_id}", response_model=ApiKeyResponse)
