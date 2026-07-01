@@ -65,6 +65,11 @@ from contextify_cloud.schemas import (
     DeviceVerifyOtpRequest,
     DeviceVerifyOtpSuccess,
 )
+from contextify_cloud.services.attribution import (
+    AcquisitionAttribution,
+    attribution_from_request,
+    attribution_to_metadata,
+)
 from contextify_cloud.services.audit import log_event
 from contextify_cloud.services.browser_auth import (
     BrowserAuthError,
@@ -630,6 +635,7 @@ async def email_init(
         email_display=email_input,
         account=account,
         device_authorization=device_authorization,
+        acquisition_attribution=attribution_from_request(request),
     )
     # ct-1512 Shard C-fix2 C-2: commit BEFORE spawning the async send so
     # the spawned task's fresh session can read the just-issued token.
@@ -681,6 +687,7 @@ async def _issue_and_send_device_email(
     email_display: str,
     account: Account | None,
     device_authorization: DeviceAuthorization,
+    acquisition_attribution: AcquisitionAttribution | None = None,
 ) -> _PendingDeviceEmailSend:
     """Issue the AuthToken row and prepare the email-send closure.
 
@@ -708,6 +715,7 @@ async def _issue_and_send_device_email(
                 "client_ip": request_ip or "",
                 "client_user_agent": user_agent or "",
             },
+            **attribution_to_metadata(acquisition_attribution),
         }
 
     issued = await issue_device_email_token(

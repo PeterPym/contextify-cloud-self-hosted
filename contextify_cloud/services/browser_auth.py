@@ -27,6 +27,12 @@ from contextify_cloud.models import (
     User,
     UserSession,
 )
+from contextify_cloud.services.attribution import (
+    AcquisitionAttribution,
+    apply_attribution_to_tenant,
+    attribution_from_metadata,
+    with_tenant_acquisition_properties,
+)
 from contextify_cloud.services.email import (
     send_email_change_confirmation,
     send_email_verification,
@@ -35,7 +41,11 @@ from contextify_cloud.services.email import (
 )
 from contextify_cloud.services.funnel_events import emit_funnel_event
 from contextify_cloud.services.operator_notifications import notify_new_signup
-from contextify_cloud.services.tenant import _sanitize_slug, provision_tenant
+from contextify_cloud.services.tenant import (
+    _sanitize_slug,
+    provision_tenant,
+    tenant_is_internal,
+)
 from contextify_cloud.utils.email import (
     hash_email_for_logs,
     hash_ip_for_logs,
@@ -764,6 +774,7 @@ async def register_with_password(
     team_name: str,
     request_ip: str | None,
     user_agent: str | None,
+    acquisition_attribution: AcquisitionAttribution | None = None,
 ) -> BrowserLoginResult:
     email_clean = email.strip()
     normalized = normalize_email(email_clean)
@@ -807,6 +818,7 @@ async def register_with_password(
         user_name=name,
         create_default_api_key=False,
     )
+    apply_attribution_to_tenant(tenant, acquisition_attribution)
     user.account_id = account.id
     await db.flush()
 
@@ -834,16 +846,21 @@ async def register_with_password(
     await db.commit()
 
     await send_welcome_email(email_clean, name, user_agent=user_agent)
+    is_internal = tenant_is_internal(tenant)
     await notify_new_signup(
         email=email_clean,
         tenant_id=str(tenant.id),
         plan=tenant.plan,
         user_agent=user_agent,
+        is_internal=is_internal,
     )
     # ct-2080: funnel event (no-op unless hosted backend registered). Opaque
     # tenant id only; coarse metadata.
     await emit_funnel_event(
-        "signup", distinct_id=str(tenant.id), properties={"plan": tenant.plan}
+        "signup",
+        distinct_id=str(tenant.id),
+        properties=with_tenant_acquisition_properties(tenant, {"plan": tenant.plan}),
+        is_internal=is_internal,
     )
     logger.info(
         "Queued verification email for new account: token_id=%s account=%s",
@@ -1659,6 +1676,7 @@ async def _create_passwordless_account_with_tenant(
     email_display: str,
     request_ip: str | None,
     user_agent: str | None,
+    acquisition_attribution: AcquisitionAttribution | None = None,
 ) -> tuple[Account, User, Tenant]:
     """Verify-then-create the (Account, Tenant, User) trio for a new signup.
 
@@ -1701,6 +1719,7 @@ async def _create_passwordless_account_with_tenant(
         user_name=local_part,
         create_default_api_key=False,
     )
+    apply_attribution_to_tenant(tenant, acquisition_attribution)
     user.account_id = account.id
     await db.flush()
     return account, user, tenant
@@ -1838,12 +1857,14 @@ async def _finalize_device_token(
     token_id_snapshot = token.id
     try:
         if token.purpose == "device_signup_new_user":
+            acquisition_attribution = attribution_from_metadata(metadata)
             account, user_obj, tenant, was_new_signup = await _resolve_signup_account(
                 db,
                 token=token,
                 metadata=metadata,
                 request_ip=request_ip,
                 user_agent=user_agent,
+                acquisition_attribution=acquisition_attribution,
             )
         else:
             account, user_obj, tenant = await _resolve_login_account(
@@ -1910,6 +1931,7 @@ async def _finalize_device_token(
     # on a Resend HTTP call before their auth-finalize response returns. The
     # signup and login branches above are mutually exclusive with
     # register_with_password, so there is no risk of double-sending.
+    is_internal = tenant_is_internal(tenant)
     if welcome_email_to is not None:
         await spawn_welcome_email_after_device_signup(
             to_email=welcome_email_to,
@@ -1924,12 +1946,16 @@ async def _finalize_device_token(
             tenant_id=str(tenant.id),
             plan=tenant.plan,
             user_agent=welcome_user_agent,
+            is_internal=is_internal,
         )
         # ct-2080: signup funnel event, only for genuine new signups (gated by
         # was_new_signup, like the notification above). No-op unless a hosted
         # backend is registered.
         await emit_funnel_event(
-            "signup", distinct_id=str(tenant.id), properties={"plan": tenant.plan}
+            "signup",
+            distinct_id=str(tenant.id),
+            properties=with_tenant_acquisition_properties(tenant, {"plan": tenant.plan}),
+            is_internal=is_internal,
         )
 
     # ct-2080 (CT2080-2): device_authorized fires on EVERY successful device
@@ -1938,7 +1964,8 @@ async def _finalize_device_token(
     await emit_funnel_event(
         "device_authorized",
         distinct_id=str(tenant.id),
-        properties={"plan": tenant.plan},
+        properties=with_tenant_acquisition_properties(tenant, {"plan": tenant.plan}),
+        is_internal=is_internal,
     )
 
     return FinalizeResult(
@@ -1959,6 +1986,7 @@ async def _resolve_signup_account(
     metadata: dict[str, object],
     request_ip: str | None,
     user_agent: str | None,
+    acquisition_attribution: AcquisitionAttribution | None = None,
 ) -> tuple[Account, User, Tenant, bool]:
     """Materialize (or recover) the account for a signup magic-link finalize.
 
@@ -2008,6 +2036,7 @@ async def _resolve_signup_account(
                 email_display=token.sent_to or raw_signup_email,
                 request_ip=request_ip,
                 user_agent=user_agent,
+                acquisition_attribution=acquisition_attribution,
             )
         return account, user, tenant, True
     except IntegrityError:

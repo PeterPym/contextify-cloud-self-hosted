@@ -253,6 +253,39 @@ async def send_local_commercial_license_email(
     )
 
 
+async def send_self_hosted_pro_license_email(
+    to_email: str,
+    license_token: str,
+    expires_at: datetime,
+    company: str,
+    seats: int,
+) -> bool:
+    """Deliver a freshly minted Self-Hosted Pro license key to the buyer (ct-2313).
+
+    Sent once on purchase fulfillment to the billing/admin contact. The body is
+    named-licensee (``company``, ``seats``) and explains server-side activation
+    via the server's license-key environment variable, unlike the app-side Local
+    Commercial activation. Renewals re-mint silently and are not re-emailed.
+    """
+    context: dict[str, object] = {
+        "license_token": license_token,
+        "expires_date": expires_at.strftime("%B %d, %Y"),
+        "company": company,
+        "seats": seats,
+        **_email_template_defaults(),
+    }
+    text = _render_email_template("email/self_hosted_pro_license.txt", **context)
+    html = _render_email_template("email/self_hosted_pro_license.html", **context)
+    return await send_transactional_email(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Your Contextify Self-Hosted Pro license",
+            text=text,
+            html=html,
+        )
+    )
+
+
 async def send_license_retrieval_email(to_email: str, retrieve_url: str) -> bool:
     """Email a one-time link to retrieve an existing Local Commercial license (ct-2015).
 

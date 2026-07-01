@@ -14,23 +14,49 @@ import logging
 import math
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from contextify_cloud.config import settings
+from contextify_cloud.http_security import _is_trusted_proxy_peer
 
 logger = logging.getLogger(__name__)
+
+
+# Hosted-only endpoints register their limits here at app-construction time
+# (the hosted billing router registers its anonymous-checkout endpoints, wired
+# from app_factory._include_hosted_routers). Keeping the registry here lets the
+# shared middleware rate-limit endpoints whose path literals live ONLY in files
+# excluded from the self-hosted commercial export (ct-2340): this module IS
+# included in that export, so it must carry no excluded path literal of its own.
+# Keyed by (METHOD, path) so re-registration overwrites and is safe across the
+# multiple app constructions tests perform.
+_registered_endpoint_limits: dict[tuple[str, str], Callable[[], int]] = {}
+
+
+def register_unauth_rate_limit(
+    method: str, path: str, limit_getter: Callable[[], int]
+) -> None:
+    """Register a per-IP rate limit for an unauthenticated endpoint.
+
+    ``limit_getter`` is called per-request inside ``_get_endpoint_limits`` so a
+    runtime setting override (e.g. a test patching settings) takes effect
+    immediately. Idempotent: re-registering the same (method, path) overwrites.
+    """
+    _registered_endpoint_limits[(method.upper(), path)] = limit_getter
 
 
 def _get_endpoint_limits() -> dict[tuple[str, str], int]:
     """Build per-endpoint rate limits from settings.
 
     Called on each request so that runtime overrides (e.g. tests patching
-    settings) take effect immediately.
+    settings) take effect immediately. Static auth limits are merged with any
+    limits registered by hosted-only routers (see ``register_unauth_rate_limit``).
     """
-    return {
+    limits: dict[tuple[str, str], int] = {
         ("POST", "/cloud/login"): settings.rate_limit_unauth_login_per_minute,
         ("POST", "/cloud/register"): settings.rate_limit_unauth_register_per_minute,
         ("POST", "/api/v1/auth/device/code"): settings.rate_limit_unauth_device_code_per_minute,
@@ -53,6 +79,11 @@ def _get_endpoint_limits() -> dict[tuple[str, str], int]:
             settings.rate_limit_unauth_invitation_accept_per_minute
         ),
     }
+    # Merge in hosted-only registered limits (e.g. ct-2340 anonymous checkout
+    # endpoints, registered by the billing router only in HOSTED mode).
+    for key, limit_getter in _registered_endpoint_limits.items():
+        limits[key] = limit_getter()
+    return limits
 
 # In-memory store: {(ip, method, path_pattern): [timestamp1, timestamp2, ...]}
 _unauth_request_log: dict[str, list[float]] = defaultdict(list)
@@ -63,17 +94,12 @@ _last_prune_time: float = 0.0
 
 WINDOW_SECONDS = 60.0  # 1-minute sliding window
 
-# Trust forwarded client IPs only when the immediate peer is a local proxy.
-# This matches the common single-host nginx -> uvicorn deployment and avoids
-# trusting spoofable X-Forwarded-For headers from arbitrary direct clients.
-_TRUSTED_PROXY_IPS = frozenset({"127.0.0.1", "::1"})
 
-
-def _parse_forwarded_for(value: str | None) -> str | None:
-    """Return the first valid IP from X-Forwarded-For, if any."""
+def _valid_ip(value: str | None) -> str | None:
+    """Return the candidate if it is a valid IP address, else None."""
     if not value:
         return None
-    candidate = value.split(",", 1)[0].strip()
+    candidate = value.strip()
     if not candidate:
         return None
     try:
@@ -83,10 +109,50 @@ def _parse_forwarded_for(value: str | None) -> str | None:
     return candidate
 
 
+def _rightmost_forwarded_for(value: str | None) -> str | None:
+    """Return the genuine rightmost X-Forwarded-For hop, if it is a valid IP.
+
+    The rightmost entry is the hop the trusted proxy appended (the real
+    client). The leftmost is client-supplied and spoofable, so it is never
+    used here. Crucially, we take ONLY the last non-empty token and validate
+    IT: we do not scan further left for the first valid token. If an attacker
+    seeds a valid-looking IP to the left and the genuine rightmost hop is
+    garbage, this returns None so the caller falls back to the peer IP rather
+    than trusting the attacker's value.
+    """
+    if not value:
+        return None
+    # Drop trailing empty/whitespace-only tokens, then take the last remaining.
+    tokens = [token.strip() for token in value.split(",")]
+    non_empty = [token for token in tokens if token]
+    if not non_empty:
+        return None
+    return _valid_ip(non_empty[-1])
+
+
 def _get_client_ip(request: Request) -> str:
+    """Resolve the client IP used for per-IP rate-limit bucketing.
+
+    Trust is determined by the shared config-driven check
+    (loopback always trusted plus any CIDR in settings.trusted_proxy_cidrs).
+    For untrusted (direct) peers, forwarding headers are ignored so an
+    attacker cannot mint fresh buckets. For trusted proxy peers, the real
+    client is resolved from X-Real-IP, then the rightmost X-Forwarded-For hop,
+    falling back to the peer IP. Never raises and never returns "".
+    """
     peer_ip = request.client.host if request.client else "unknown"
-    if peer_ip in _TRUSTED_PROXY_IPS:
-        return _parse_forwarded_for(request.headers.get("x-forwarded-for")) or peer_ip
+
+    if not _is_trusted_proxy_peer(peer_ip):
+        # Direct attacker: ignore forwarding headers entirely (spoof-safety).
+        return peer_ip
+
+    # Trusted proxy: prefer X-Real-IP, else rightmost X-Forwarded-For hop.
+    real_ip = _valid_ip(request.headers.get("x-real-ip"))
+    if real_ip is not None:
+        return real_ip
+    forwarded = _rightmost_forwarded_for(request.headers.get("x-forwarded-for"))
+    if forwarded is not None:
+        return forwarded
     return peer_ip
 
 

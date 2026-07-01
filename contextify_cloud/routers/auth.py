@@ -43,7 +43,11 @@ from contextify_cloud.schemas import (
 from contextify_cloud.services.audit import log_event
 from contextify_cloud.services.browser_handoff import issue_browser_handoff_token
 from contextify_cloud.services.funnel_events import emit_funnel_event
-from contextify_cloud.services.tenant import _sanitize_slug, provision_tenant
+from contextify_cloud.services.tenant import (
+    _sanitize_slug,
+    provision_tenant,
+    tenant_is_internal,
+)
 from contextify_cloud.services.tenant_guard import check_tenant_active
 
 logger = logging.getLogger(__name__)
@@ -428,10 +432,14 @@ async def revoke_api_key(
         )
     ).scalar() or 0
     if remaining_active == 0:
+        tenant = (
+            await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
+        ).scalar_one_or_none()
         await emit_funnel_event(
             "churn_signal",
             distinct_id=str(auth.tenant_id),
             properties={"churn_kind": "key_revoke"},
+            is_internal=tenant_is_internal(tenant),
         )
 
 

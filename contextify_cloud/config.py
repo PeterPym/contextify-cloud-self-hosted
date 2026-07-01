@@ -85,6 +85,29 @@ class Settings(BaseSettings):
     # refuses to fulfill without it: it raises so Stripe retries and ops is
     # alerted, rather than minting unsigned tokens or dropping a paid purchase.
     commercial_license_signing_key: str = ""
+    # Ed25519 private signing key (base64url, raw 32 bytes) for the Self-Hosted Pro
+    # self-serve purchase webhook (ct-2313). A SEPARATE online key (kid="shp1") so
+    # the offline "v1" Self-Hosted key never goes online; the matching public half
+    # is COMMERCIAL_LICENSE_PUBLIC_KEYS["shp1"]. Empty in dev/CI; in production the
+    # webhook refuses to fulfill without it (raises -> Stripe retries, ops alerted)
+    # rather than dropping a paid purchase.
+    commercial_license_signing_key_shp1: str = ""
+    # Self-Hosted Pro auto-mint (ct-2313). When False (the launch default), a
+    # completed purchase still mints + persists the license idempotently, but the
+    # key email is HELD (delivery_status 'held') for operator approval; an operator
+    # release flips it to 'pending' and the outbox sends. When True, delivery is
+    # fully automatic. The license always exists either way (no silent-drop window);
+    # the gate is purely a delivery release. Repo-access provisioning follows the
+    # same flag (manual for first buyers while off). Keep this OFF until there is a
+    # refund/chargeback answer: an offline token cannot be revoked once delivered,
+    # so the held-delivery gate is the only take-back before the key is out, making
+    # this flag load-bearing for fraud control, not just operational caution.
+    self_hosted_pro_auto_mint: bool = False
+    # GitHub token (repo scope) used to grant a Self-Hosted Pro licensee pull
+    # access to the private commercial mirror (ct-2313). Unset in dev/CI. The
+    # grant is operator-run during onboarding: checkout collects an email, not a
+    # GitHub username, so a fully automatic grant-on-purchase is a follow-up.
+    github_repo_access_token: str = ""
     enable_docs: bool = False  # Set True locally to enable /api/docs, /api/redoc, /openapi.json
     enable_registration: bool = False  # Public self-serve registration is off by default
 
@@ -160,6 +183,8 @@ class Settings(BaseSettings):
     # per-token OTP lockout is enforced inside ``verify_device_otp_attempt``.
     rate_limit_unauth_login_email_link_per_minute: int = 10
     rate_limit_unauth_login_verify_otp_per_minute: int = 10
+    # ct-2340 — per-IP cap on the anonymous checkout endpoints (card-testing surface).
+    rate_limit_unauth_checkout_per_minute: int = 5
 
     # Magic-link / OTP device flow (cloud-magic-link spec §5.3, §10).
     # AuthToken expiry for device-flow magic-link / OTP tokens is 10 minutes.

@@ -36,6 +36,23 @@ _IMPORTANT_HEADERS: dict[str, str] = {
     "X-MSMail-Priority": "High",
 }
 
+# Product-aware lead nouns for cancellation notices, keyed off the canonical
+# product value; unknown products fall back to the generic Cloud lead.
+_CANCELLED_LEADS: dict[str, str] = {
+    "self_hosted_pro": "A Self-Hosted Pro license was just cancelled.",
+    "local_commercial": "A Local Commercial license was just cancelled.",
+    "cloud": "A Contextify Cloud subscription was just cancelled.",
+}
+
+# Product-aware subject templates for cancellation notices, keyed off the
+# canonical product value; unknown products fall back to the generic Cloud
+# cancellation subject (safe default). Each template contains ``{who}``.
+_CANCELLED_SUBJECTS: dict[str, str] = {
+    "self_hosted_pro": "Self-Hosted Pro license cancelled: {who}",
+    "local_commercial": "Local Commercial license cancelled: {who}",
+    "cloud": "Contextify Cloud cancellation: {who}",
+}
+
 
 def _operator_notifications_enabled() -> bool:
     """Operator notifications run only in managed mode with a recipient set."""
@@ -74,8 +91,11 @@ async def notify_new_signup(
     tenant_id: str,
     plan: str,
     user_agent: str | None = None,
+    is_internal: bool = False,
 ) -> bool:
     """Notify the operator that a new account/tenant signed up."""
+    if is_internal:
+        return False
     platform = _classify_signup_platform(user_agent) if user_agent else None
     platform_line = f"\nPlatform (guessed): {platform}" if platform else ""
     text = (
@@ -93,6 +113,7 @@ async def notify_first_activation(
     *,
     email: str | None,
     tenant_id: str,
+    is_internal: bool = False,
 ) -> bool:
     """Notify the operator that a tenant landed its first successful sync.
 
@@ -100,6 +121,8 @@ async def notify_first_activation(
     having data. Fired once, on the first push that accepts data for a tenant
     that previously had none.
     """
+    if is_internal:
+        return False
     who = email or "(unknown user)"
     text = (
         "A Contextify Cloud tenant just completed its FIRST successful sync "
@@ -118,8 +141,11 @@ async def notify_became_paid(
     email: str | None,
     tenant_id: str,
     plan: str,
+    is_internal: bool = False,
 ) -> bool:
     """Notify the operator (high-priority) that a tenant became paid."""
+    if is_internal:
+        return False
     who = email or "(unknown user)"
     text = (
         "A Contextify Cloud tenant just became PAID.\n\n"
@@ -131,4 +157,97 @@ async def notify_became_paid(
         subject=f"[IMPORTANT] Contextify Cloud paid conversion: {who}",
         text=text,
         important=True,
+    )
+
+
+def _should_notify_for_event(
+    *,
+    livemode: bool,
+    is_internal: bool = False,
+    test_metadata: bool = False,
+) -> bool:
+    """Decide whether a consequential billing event warrants an operator notice.
+
+    Pure, synchronous suppression predicate the billing webhook calls BEFORE
+    routing to a notify_* function. Stripe ``livemode`` is the primary universal
+    backstop: test-mode events never notify, regardless of the other flags. An
+    internal/QA tenant (``is_internal``) or an explicit test marker
+    (``test_metadata``) also suppress. Otherwise the event is live and external,
+    so notify.
+    """
+    if not livemode:
+        return False
+    if is_internal:
+        return False
+    if test_metadata:
+        return False
+    return True
+
+
+async def notify_self_hosted_pro_purchase(
+    *,
+    company: str,
+    admin_contact: str,
+    seats: int,
+    amount: str,
+) -> bool:
+    """Notify the operator (high-priority) of a Self-Hosted Pro purchase."""
+    text = (
+        "A Self-Hosted Pro license was just purchased.\n\n"
+        f"Company:       {company}\n"
+        f"Admin contact: {admin_contact}\n"
+        f"Seats:         {seats}\n"
+        f"Amount:        {amount}\n"
+    )
+    return await _send_operator_email(
+        subject=f"[IMPORTANT] Self-Hosted Pro purchase: {company}",
+        text=text,
+        important=True,
+    )
+
+
+async def notify_local_commercial_purchase(
+    *,
+    customer_email: str,
+    seats: int,
+    amount: str,
+) -> bool:
+    """Notify the operator (high-priority) of a Local Commercial license purchase."""
+    text = (
+        "A Local Commercial license was just purchased.\n\n"
+        f"Customer: {customer_email}\n"
+        f"Seats:    {seats}\n"
+        f"Amount:   {amount}\n"
+    )
+    return await _send_operator_email(
+        subject=f"[IMPORTANT] Local Commercial purchase: {customer_email}",
+        text=text,
+        important=True,
+    )
+
+
+async def notify_subscription_cancelled(
+    *,
+    who: str,
+    product: str,
+    plan: str,
+) -> bool:
+    """Notify the operator (normal priority) that a subscription was cancelled."""
+    # Lead with a product-aware noun keyed off the canonical product value;
+    # unknown products fall back to the generic Cloud lead (safe default).
+    lead = _CANCELLED_LEADS.get(
+        product, "A Contextify Cloud subscription was just cancelled."
+    )
+    text = (
+        f"{lead}\n\n"
+        f"Who:     {who}\n"
+        f"Product: {product}\n"
+        f"Plan:    {plan}\n"
+    )
+    subject = _CANCELLED_SUBJECTS.get(
+        product, "Contextify Cloud cancellation: {who}"
+    ).format(who=who)
+    return await _send_operator_email(
+        subject=subject,
+        text=text,
     )

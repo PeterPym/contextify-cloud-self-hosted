@@ -2,9 +2,15 @@
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    EmailStr,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 # --- Auth ---
 
@@ -513,6 +519,31 @@ class LocalCommercialCheckoutRequest(BaseModel):
         None,
         description="Buyer email for an anonymous purchase (ignored when logged in)",
     )
+
+
+class SelfHostedProCheckoutRequest(BaseModel):
+    """Request for the named-licensee Self-Hosted Pro checkout (ct-2313).
+
+    Unlike Local Commercial, this is a named-licensee commercial purchase: the
+    Licensee company, a billing/admin contact, and a seat count are required.
+    The price is server-fixed (the configured Self-Hosted Pro annual price), so
+    no buyer-supplied price_id is accepted.
+    """
+
+    # Stripped + non-empty after strip, so the named Licensee is a real value and
+    # not whitespace that becomes an empty company claim in the token (ct-2313
+    # review). A blank/whitespace company is a standard 422.
+    company: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ] = Field(..., description="The Licensee (company) named on the license")
+    admin_contact: EmailStr = Field(
+        ..., description="Billing/admin contact email; the license key is sent here"
+    )
+    seats: int = Field(
+        ..., ge=3, le=10000, description="Seat count (three-seat minimum)"
+    )
+    success_url: str = Field(..., description="URL to redirect after successful payment")
+    cancel_url: str = Field(..., description="URL to redirect if checkout is cancelled")
 
 
 class PortalResponse(BaseModel):

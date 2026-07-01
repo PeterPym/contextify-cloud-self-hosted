@@ -97,6 +97,15 @@ class Tenant(Base):
     second_device_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    acquisition_token: Mapped[str | None] = mapped_column(Text)
+    acquisition_source: Mapped[str | None] = mapped_column(Text)
+    acquisition_medium: Mapped[str | None] = mapped_column(Text)
+    acquisition_campaign: Mapped[str | None] = mapped_column(Text)
+    acquisition_content: Mapped[str | None] = mapped_column(Text)
+    acquisition_landing_path: Mapped[str | None] = mapped_column(Text)
+    acquisition_captured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     users: Mapped[list["User"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
@@ -933,6 +942,11 @@ class License(Base):
         server_default="local_commercial",
     )
     customer_email: Mapped[str] = mapped_column(Text, nullable=False)
+    # The named Licensee (company) for a named-licensee commercial license, e.g.
+    # Self-Hosted Pro (ct-2313); also the token's `customer` claim. NULL for
+    # Local Commercial rows, which are email-only (not named-licensee). The
+    # billing/admin contact for those licenses is `customer_email`.
+    company: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Optional association to a Cloud tenant when the buyer logged in at checkout;
     # NULL for an anonymous, email-only purchase. Unconstrained on purpose so a
     # license outlives any tenant lifecycle change.
@@ -979,7 +993,7 @@ class License(Base):
     __table_args__ = (
         CheckConstraint("seats >= 1", name="ck_licenses_seats_positive"),
         CheckConstraint(
-            "delivery_status IN ('pending', 'sent', 'failed', 'exhausted')",
+            "delivery_status IN ('pending', 'sent', 'failed', 'exhausted', 'held')",
             name="ck_licenses_delivery_status",
         ),
         # Case-insensitive retrieval by email (buyers may re-enter a different case).

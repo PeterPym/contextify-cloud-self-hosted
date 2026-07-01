@@ -534,6 +534,10 @@ def _include_hosted_routers(app: FastAPI) -> None:
 
     app.include_router(ops_routes.router)
     app.include_router(billing.router)
+    # ct-2340: register the anonymous-checkout per-IP rate limits via the billing
+    # router itself (HOSTED only), keeping the billing path literals out of any
+    # file shipped in the self-hosted commercial export.
+    billing.register_billing_rate_limits()
     app.include_router(invitations.router)
     app.include_router(internal_growth.router)
     app.include_router(internal_support.router)

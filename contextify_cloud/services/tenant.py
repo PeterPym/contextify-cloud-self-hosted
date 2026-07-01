@@ -366,13 +366,14 @@ async def provision_tenant(
     email: str,
     user_name: str | None = None,
     create_default_api_key: bool = True,
+    is_internal: bool = False,
 ) -> tuple[Tenant, User, str | None]:
     """Provision a new tenant with owner user and API key.
 
     Returns (tenant, user, raw_api_key).
     """
     # Create tenant
-    tenant = Tenant(name=name, slug=_sanitize_slug(slug))
+    tenant = Tenant(name=name, slug=_sanitize_slug(slug), is_internal=is_internal)
     db.add(tenant)
     await db.flush()
 
@@ -411,6 +412,15 @@ async def provision_tenant(
     )
 
     return tenant, user, raw_key
+
+
+def tenant_is_internal(tenant: object | None) -> bool:
+    """Return True only for tenants explicitly flagged internal.
+
+    Tests and some webhook paths use lightweight tenant doubles. Treat missing
+    or mock-generated attributes as external so analytics suppression is opt-in.
+    """
+    return getattr(tenant, "is_internal", False) is True
 
 
 def get_tenant_schema(slug: str) -> str:

@@ -51,6 +51,7 @@ async def emit_funnel_event(
     *,
     distinct_id: str,
     properties: Mapping[str, Any] | None = None,
+    is_internal: bool = False,
 ) -> None:
     """Emit one funnel event. No-op unless a backend is registered.
 
@@ -59,7 +60,10 @@ async def emit_funnel_event(
     signup / sync / billing request paths. Best-effort: a backend failure is
     swallowed so analytics can never break the caller. ``distinct_id`` must be an
     opaque id (tenant/user UUID), never PII; ``properties`` must be coarse
-    metadata only (the backend additionally enforces a property allowlist)."""
+    metadata only (the backend additionally enforces a property allowlist).
+    Internal tenants are QA/developer accounts and never emit funnel analytics."""
+    if is_internal:
+        return
     backend = _backend
     if backend is None:
         return

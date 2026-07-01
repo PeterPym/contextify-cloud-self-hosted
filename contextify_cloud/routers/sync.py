@@ -36,6 +36,7 @@ from contextify_cloud.schemas import (
     SyncPushResponse,
     SyncStatusResponse,
 )
+from contextify_cloud.services.attribution import with_tenant_acquisition_properties
 from contextify_cloud.services.audit import log_event
 from contextify_cloud.services.funnel_events import emit_funnel_event, funnel_backend_registered
 from contextify_cloud.services.operator_notifications import notify_first_activation
@@ -52,7 +53,11 @@ from contextify_cloud.services.sync_status import (
     session_is_bulk_catch_up,
     session_is_effectively_complete,
 )
-from contextify_cloud.services.tenant import ensure_tenant_schema_compat, get_tenant_schema
+from contextify_cloud.services.tenant import (
+    ensure_tenant_schema_compat,
+    get_tenant_schema,
+    tenant_is_internal,
+)
 from contextify_cloud.services.tenant_guard import check_tenant_active
 from contextify_cloud.services.user_scoping import build_user_scope_clause
 from contextify_cloud.sync_partial_accept import PartialAcceptSpec, validate_items
@@ -1654,14 +1659,21 @@ async def sync_push(
     # earlier and never reach here, so it does not double-fire. The email lookup
     # ran earlier, so this adds no trailing DB query (fire-and-forget).
     if is_first_activation:
+        is_internal = tenant_is_internal(tenant_obj)
         await notify_first_activation(
-            email=activation_email, tenant_id=str(auth.tenant_id)
+            email=activation_email,
+            tenant_id=str(auth.tenant_id),
+            is_internal=is_internal,
         )
         # ct-2080: funnel event (no-op unless hosted backend registered).
         await emit_funnel_event(
             "first_sync",
             distinct_id=str(auth.tenant_id),
-            properties={"entries_accepted": entries_accepted},
+            properties=with_tenant_acquisition_properties(
+                tenant_obj,
+                {"entries_accepted": entries_accepted},
+            ),
+            is_internal=is_internal,
         )
 
     # ct-2106 + ct-2107: second_device_sync, the real ct-1460 activation North-Star.
@@ -1694,7 +1706,11 @@ async def sync_push(
     # confines any such failure, the outer transaction stays committable, and activation
     # analytics genuinely cannot break a sync. emit_funnel_event is fire-and-forget and
     # touches no DB, so it runs AFTER the savepoint, outside the failure boundary.
-    if device_was_first_sync and funnel_backend_registered():
+    if (
+        device_was_first_sync
+        and not tenant_is_internal(tenant_obj)
+        and funnel_backend_registered()
+    ):
         event_payload: dict[str, Any] | None = None
         try:
             async with db.begin_nested():
@@ -1752,7 +1768,11 @@ async def sync_push(
             await emit_funnel_event(
                 "second_device_sync",
                 distinct_id=str(auth.tenant_id),
-                properties=event_payload,
+                properties=with_tenant_acquisition_properties(
+                    tenant_obj,
+                    event_payload,
+                ),
+                is_internal=tenant_is_internal(tenant_obj),
             )
 
     return response
