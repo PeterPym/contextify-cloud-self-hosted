@@ -82,6 +82,15 @@ a:hover {
   color: var(--contextify-primary-hover) !important;
 }
 
+/* Static wordmark on minimal-chrome pages (signup): a brand mark, not a link. */
+.ctxf-brand-static {
+  cursor: default;
+}
+
+.ctxf-brand-static:hover {
+  color: var(--contextify-primary) !important;
+}
+
 .ctxf-navbar .nav-link {
   color: var(--text-secondary);
   font-size: 0.9rem;
@@ -341,6 +350,80 @@ a:hover {
   background-color: var(--contextify-primary-hover);
   border-color: var(--contextify-primary-hover);
   color: #ffffff;
+}
+
+.ctxf-auth-fineprint {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.ctxf-auth-steps {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--slate-200);
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+.ctxf-auth-steps-label {
+  margin: 0 0 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+[data-bs-theme="dark"] .ctxf-auth-steps {
+  border-top-color: var(--bg-muted);
+}
+
+.ctxf-auth-step {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.ctxf-auth-step-num {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background-color: var(--contextify-primary);
+  color: #ffffff;
+}
+
+.ctxf-auth-step-num-next {
+  background-color: var(--slate-200);
+  color: var(--text-secondary);
+}
+
+[data-bs-theme="dark"] .ctxf-auth-step-num-next {
+  background-color: var(--bg-muted);
+}
+
+.ctxf-auth-legal {
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.ctxf-auth-signin {
+  margin-top: 1.5rem;
+}
+
+.ctxf-auth-trust {
+  margin-top: 1rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
 }
 
 /* ── Activity feed ───────────────────────────────────────── */

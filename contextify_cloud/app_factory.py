@@ -48,9 +48,7 @@ def _is_hosted_contextify_url(value: str) -> bool:
         host = None
     if host:
         host = host.rstrip(".")
-        return host == HOSTED_CONTEXTIFY_HOST or host.endswith(
-            f".{HOSTED_CONTEXTIFY_HOST}"
-        )
+        return host == HOSTED_CONTEXTIFY_HOST or host.endswith(f".{HOSTED_CONTEXTIFY_HOST}")
     return HOSTED_CONTEXTIFY_HOST in lowered
 
 
@@ -154,9 +152,11 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
         settings.support_admin_token
         and len(settings.support_admin_token) < MIN_SUPPORT_ADMIN_TOKEN_LENGTH
     ):
-        raise RuntimeError(
-            "SUPPORT_ADMIN_TOKEN must be at least 32 characters when configured."
-        )
+        raise RuntimeError("SUPPORT_ADMIN_TOKEN must be at least 32 characters when configured.")
+    try:
+        settings.cors_origins
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 async def _purge_scheduler_loop() -> None:
@@ -178,9 +178,7 @@ async def _purge_scheduler_loop() -> None:
         # ct-1841 follow-up (unit-7 audit iter-02): live path captures here.
         # The main.py-side compat functions are kept in sync but never run
         # under the production app_factory.lifespan.
-        monitoring.capture_background_exception(
-            exc, job="purge_scheduler", phase="startup"
-        )
+        monitoring.capture_background_exception(exc, job="purge_scheduler", phase="startup")
 
     while True:
         await asyncio.sleep(settings.purge_check_interval_seconds)
@@ -194,9 +192,7 @@ async def _purge_scheduler_loop() -> None:
                 )
         except Exception as exc:
             logger.error("Scheduled purge sweep failed", exc_info=True)
-            monitoring.capture_background_exception(
-                exc, job="purge_scheduler", phase="scheduled"
-            )
+            monitoring.capture_background_exception(exc, job="purge_scheduler", phase="scheduled")
 
 
 async def _auth_email_outbox_scheduler_loop() -> None:
@@ -223,9 +219,7 @@ async def _auth_email_outbox_scheduler_loop() -> None:
             )
     except Exception as exc:
         logger.error("Startup auth email outbox sweep failed", exc_info=True)
-        monitoring.capture_background_exception(
-            exc, job="auth_email_outbox", phase="startup"
-        )
+        monitoring.capture_background_exception(exc, job="auth_email_outbox", phase="startup")
 
     while True:
         await asyncio.sleep(settings.auth_email_outbox_interval_seconds)
@@ -243,9 +237,7 @@ async def _auth_email_outbox_scheduler_loop() -> None:
                 )
         except Exception as exc:
             logger.error("Scheduled auth email outbox sweep failed", exc_info=True)
-            monitoring.capture_background_exception(
-                exc, job="auth_email_outbox", phase="scheduled"
-            )
+            monitoring.capture_background_exception(exc, job="auth_email_outbox", phase="scheduled")
 
 
 async def _license_delivery_outbox_scheduler_loop() -> None:
@@ -272,9 +264,7 @@ async def _license_delivery_outbox_scheduler_loop() -> None:
             )
     except Exception as exc:
         logger.error("Startup license delivery outbox sweep failed", exc_info=True)
-        monitoring.capture_background_exception(
-            exc, job="license_delivery_outbox", phase="startup"
-        )
+        monitoring.capture_background_exception(exc, job="license_delivery_outbox", phase="startup")
 
     while True:
         await asyncio.sleep(settings.license_delivery_outbox_interval_seconds)
@@ -341,6 +331,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
                 # Sentry because 400 isn't in the global whitelist. Surface
                 # it explicitly so operators can spot probe/abuse waves.
                 from contextify_cloud import monitoring as _monitoring
+
                 _monitoring.capture_handled_operational_response(
                     request=request,
                     status_code=400,
@@ -353,8 +344,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
                 )
             if content_length_int > settings.max_request_body_bytes:
                 logger.warning(
-                    "Request rejected: body size %d exceeds limit %d "
-                    "path=%s method=%s ip=%s",
+                    "Request rejected: body size %d exceeds limit %d path=%s method=%s ip=%s",
                     content_length_int,
                     settings.max_request_body_bytes,
                     request.url.path,
@@ -519,7 +509,7 @@ def _include_core_routers(app: FastAPI) -> None:
 
 
 def _include_hosted_routers(app: FastAPI) -> None:
-    from contextify_cloud.hosted import funnel_backend, ops_routes
+    from contextify_cloud.hosted import funnel_backend, ops_routes, telemetry_relay
     from contextify_cloud.routers import (
         admin,
         analytics,
@@ -547,9 +537,17 @@ def _include_hosted_routers(app: FastAPI) -> None:
     app.include_router(tenant_admin.router)
     app.include_router(dashboard.router)
 
-    # ct-2080: register the hosted-only funnel-analytics backend (inert until the
-    # operator provisions the ingest key, ct-2087). HOSTED profile only.
-    funnel_backend.install()
+    # ct-2080/ct-2550: register the hosted-only funnel-analytics backend.
+    # HOSTED profile must fail closed if capture is not configured; otherwise
+    # the activation funnel can silently look like zero activation.
+    funnel_backend.install(require_configured=True)
+
+    # ct-2614: register the hosted-only first-party telemetry relay (POST /capture/
+    # served on telemetry.contextify.sh). Host-checked in-handler and per-IP rate
+    # limited via register_telemetry_rate_limits(); the route path literal + key
+    # live only in the hosted (mirror-excluded) module.
+    app.include_router(telemetry_relay.router)
+    telemetry_relay.register_telemetry_rate_limits()
 
 
 def _include_commercial_self_hosted_routers(app: FastAPI) -> None:

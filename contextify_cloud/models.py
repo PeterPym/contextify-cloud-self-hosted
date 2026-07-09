@@ -38,9 +38,7 @@ class TenantStatus(enum.StrEnum):
 class Tenant(Base):
     __tablename__ = "tenants"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     slug: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     plan: Mapped[str] = mapped_column(
@@ -48,25 +46,22 @@ class Tenant(Base):
         nullable=False,
         default="free",
     )
-    billing_interval: Mapped[str] = mapped_column(
-        Text, nullable=False, default="month"
-    )
+    billing_interval: Mapped[str] = mapped_column(Text, nullable=False, default="month")
     stripe_customer_id: Mapped[str | None] = mapped_column(Text, unique=True)
     stripe_subscription_id: Mapped[str | None] = mapped_column(Text)
     max_seats: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    subscription_status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="active"
-    )
+    subscription_status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
     current_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    cancel_at_period_end: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False
-    )
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
     )
     # Data privacy: supports GDPR/CCPA deletion requests.
     # When set, background job should purge tenant data within retention window.
@@ -75,37 +70,37 @@ class Tenant(Base):
     data_retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Tenant lifecycle status. Controls API access gating.
     status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="active", server_default="active",
+        Text,
+        nullable=False,
+        default="active",
+        server_default="active",
     )
     # Purge scheduling: computed deadline for data destruction.
     purge_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Tracks why deletion was triggered (explicit user action vs subscription end).
     deletion_trigger: Mapped[str | None] = mapped_column(Text)
     # Project allow-list: NULL = allow all, [] = block all, [...] = only listed names.
-    project_allowlist: Mapped[list[str] | None] = mapped_column(
-        ARRAY(String), nullable=True
-    )
+    project_allowlist: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     # Internal flag for downstream analytics/billing exclusion logic.
     # Used for QA, test, and developer accounts.
     is_internal: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false"),
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
     )
     # ct-2107: fire-once marker for the second_device_sync activation North-Star.
     # Set exactly once (NULL -> timestamp) when a tenant's 2nd distinct device
     # completes its first sync, claimed atomically under a per-tenant advisory lock
     # in the sync router so concurrent first-syncs neither double-fire nor miss.
-    second_device_synced_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    second_device_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     acquisition_token: Mapped[str | None] = mapped_column(Text)
     acquisition_source: Mapped[str | None] = mapped_column(Text)
     acquisition_medium: Mapped[str | None] = mapped_column(Text)
     acquisition_campaign: Mapped[str | None] = mapped_column(Text)
     acquisition_content: Mapped[str | None] = mapped_column(Text)
     acquisition_landing_path: Mapped[str | None] = mapped_column(Text)
-    acquisition_captured_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    acquisition_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     users: Mapped[list["User"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
@@ -150,12 +145,8 @@ class DeletedTenant(Base):
 
     __tablename__ = "deleted_tenants"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, unique=True
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
     slug: Mapped[str] = mapped_column(Text, nullable=False)
     owner_email: Mapped[str] = mapped_column(Text, nullable=False)
     plan: Mapped[str] = mapped_column(Text, nullable=False)
@@ -163,19 +154,11 @@ class DeletedTenant(Base):
     stripe_subscription_id: Mapped[str | None] = mapped_column(Text)
     billing_interval: Mapped[str | None] = mapped_column(Text)
     deletion_trigger: Mapped[str] = mapped_column(Text, nullable=False)
-    deletion_requested_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    purge_due_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    deletion_requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    purge_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    tombstone_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
-    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True)
-    )
+    tombstone_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
@@ -199,9 +182,7 @@ class Account(Base):
 
     __tablename__ = "accounts"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email_normalized: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     email_display: Mapped[str] = mapped_column(Text, nullable=False)
     password_hash: Mapped[str | None] = mapped_column(Text)
@@ -217,9 +198,7 @@ class Account(Base):
     tos_version: Mapped[str | None] = mapped_column(Text)
     tos_ip: Mapped[str | None] = mapped_column(Text)
     tos_user_agent: Mapped[str | None] = mapped_column(Text)
-    password_prompt_dismissed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    password_prompt_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
@@ -250,9 +229,7 @@ class Account(Base):
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -268,7 +245,7 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="users")
@@ -284,9 +261,7 @@ class User(Base):
         UniqueConstraint("tenant_id", "email", name="uq_user_tenant_email"),
         UniqueConstraint("id", "tenant_id", name="uq_user_id_tenant"),
         UniqueConstraint("id", "account_id", "tenant_id", name="uq_user_account_tenant"),
-        CheckConstraint(
-            "role IN ('owner', 'admin', 'member', 'viewer')", name="ck_user_role"
-        ),
+        CheckConstraint("role IN ('owner', 'admin', 'member', 'viewer')", name="ck_user_role"),
         Index("idx_users_account_id", "account_id"),
         Index(
             "uq_users_active_tenant_account",
@@ -303,9 +278,7 @@ class UserSession(Base):
 
     __tablename__ = "user_sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
     )
@@ -351,9 +324,7 @@ class AuthToken(Base):
 
     __tablename__ = "auth_tokens"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE")
     )
@@ -419,9 +390,7 @@ class AuthToken(Base):
             "uq_auth_tokens_active_signup_email",
             text("lower(btrim(metadata_json->>'signup_email'))"),
             unique=True,
-            postgresql_where=text(
-                "purpose = 'device_signup_new_user' AND consumed_at IS NULL"
-            ),
+            postgresql_where=text("purpose = 'device_signup_new_user' AND consumed_at IS NULL"),
         ),
         Index(
             "idx_auth_tokens_delivery_retry",
@@ -437,9 +406,7 @@ class BrowserHandoffToken(Base):
 
     __tablename__ = "browser_handoff_tokens"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(Text, nullable=False)
     account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
@@ -494,9 +461,7 @@ class BrowserHandoffToken(Base):
 class Device(Base):
     __tablename__ = "devices"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
@@ -506,14 +471,12 @@ class Device(Base):
     app_version: Mapped[str | None] = mapped_column(Text)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     user: Mapped["User"] = relationship(back_populates="devices")
 
-    __table_args__ = (
-        UniqueConstraint("user_id", "machine_id", name="uq_device_user_machine"),
-    )
+    __table_args__ = (UniqueConstraint("user_id", "machine_id", name="uq_device_user_machine"),)
 
 
 class ApiKey(Base):
@@ -530,9 +493,7 @@ class ApiKey(Base):
 
     __tablename__ = "api_keys"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
@@ -547,11 +508,13 @@ class ApiKey(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     session_nonce: Mapped[str] = mapped_column(
-        Text, nullable=False, default=lambda: secrets.token_hex(16),
+        Text,
+        nullable=False,
+        default=lambda: secrets.token_hex(16),
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     user: Mapped["User"] = relationship(back_populates="api_keys", overlaps="tenant")
@@ -582,9 +545,7 @@ class Invitation(Base):
 
     __tablename__ = "invitations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -594,11 +555,9 @@ class Invitation(Base):
     invited_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     accepted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
@@ -654,12 +613,10 @@ class UsageEvent(Base):
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     entry_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
-    __table_args__ = (
-        Index("idx_usage_tenant_date", "tenant_id", "created_at"),
-    )
+    __table_args__ = (Index("idx_usage_tenant_date", "tenant_id", "created_at"),)
 
 
 class ProcessedEvent(Base):
@@ -678,7 +635,7 @@ class ProcessedEvent(Base):
     event_id: Mapped[str] = mapped_column(Text, primary_key=True)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     processed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     outcome: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -701,9 +658,7 @@ class SyncIdempotency(Base):
 
     __tablename__ = "sync_idempotency"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -713,10 +668,11 @@ class SyncIdempotency(Base):
     response_json: Mapped[str | None] = mapped_column(Text)
     is_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
+        DateTime(timezone=True),
+        nullable=False,
     )
 
     __table_args__ = (
@@ -740,9 +696,7 @@ class SyncSession(Base):
 
     __tablename__ = "sync_sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -751,19 +705,13 @@ class SyncSession(Base):
     )
     device_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="in_progress"
-    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="in_progress")
     total_batches: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completed_batches: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_batch_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_batch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -803,7 +751,7 @@ class AuditLog(Base):
     detail: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -862,9 +810,7 @@ class DeviceAuthorization(Base):
 
     __tablename__ = "device_authorizations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Legacy plaintext columns are nullable for rows created before 027. New
     # rows store only keyed HMAC digests in *_hash lookup columns.
     device_code: Mapped[str | None] = mapped_column(Text, unique=True)
@@ -874,9 +820,7 @@ class DeviceAuthorization(Base):
     verification_uri: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     # Linked after user authorizes in browser
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True)
-    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE")
     )
@@ -886,13 +830,11 @@ class DeviceAuthorization(Base):
     )
     client_name: Mapped[str | None] = mapped_column(Text)
     client_ip: Mapped[str | None] = mapped_column(Text)
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     poll_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.now
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -932,13 +874,13 @@ class License(Base):
 
     __tablename__ = "licenses"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # The license_id claim embedded in the signed token; the stable external id.
     license_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     product: Mapped[str] = mapped_column(
-        Text, nullable=False, default="local_commercial",
+        Text,
+        nullable=False,
+        default="local_commercial",
         server_default="local_commercial",
     )
     customer_email: Mapped[str] = mapped_column(Text, nullable=False)
@@ -954,14 +896,15 @@ class License(Base):
     stripe_customer_id: Mapped[str | None] = mapped_column(Text)
     # The Stripe subscription is the one-row-per-purchase idempotency key, so it
     # is required (a NULL would not be deduped by the unique constraint).
-    stripe_subscription_id: Mapped[str] = mapped_column(
-        Text, nullable=False, unique=True
-    )
+    stripe_subscription_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     # Signing key id the token was minted with (e.g. "lc1").
     kid: Mapped[str] = mapped_column(Text, nullable=False)
     seats: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="active", server_default="active",
+        Text,
+        nullable=False,
+        default="active",
+        server_default="active",
     )
     # The signed offline token blob; re-minted on each invoice.paid renewal.
     token: Mapped[str] = mapped_column(Text, nullable=False)
@@ -981,12 +924,16 @@ class License(Base):
     delivery_last_error: Mapped[str | None] = mapped_column(Text)
     delivery_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now(UTC), server_default=text("now()"),
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("now()"),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC),
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
         server_default=text("now()"),
     )
 
@@ -1019,9 +966,7 @@ class LicenseRetrievalToken(Base):
 
     __tablename__ = "license_retrieval_tokens"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email_normalized: Mapped[str] = mapped_column(Text, nullable=False)
     # sha256 of the raw token; the raw value lives only in the emailed link.
     token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)

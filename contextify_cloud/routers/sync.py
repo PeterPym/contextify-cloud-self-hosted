@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi import Request as HttpRequest
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -265,6 +265,67 @@ async def _rollback_savepoint(db: AsyncSession, sp: str) -> None:
         logger.debug("Savepoint release failed for %s: %s", sp, e)
 
 
+def _entry_insert_params(
+    entry: SyncEntry,
+    *,
+    suffix: str,
+    auth: AuthContext,
+    device: Device | None,
+) -> dict[str, object]:
+    return {
+        f"id{suffix}": entry.id,
+        f"transcript_id{suffix}": entry.transcript_id,
+        f"project_id{suffix}": entry.project_id,
+        f"session_id{suffix}": entry.session_id,
+        f"provider{suffix}": entry.provider,
+        f"kind{suffix}": entry.kind,
+        f"timestamp{suffix}": entry.timestamp,
+        # ct-1841: chunked entries arrive with `content` unset and content split
+        # into `content_chunks`. Materialize back to a single string here so the
+        # INSERT sees one logical row regardless of the transport shape.
+        f"content{suffix}": entry.materialized_content(),
+        f"content_sha256{suffix}": entry.content_sha256,
+        f"display_in_timeline{suffix}": entry.display_in_timeline,
+        f"git_branch{suffix}": entry.git_branch,
+        f"git_commit{suffix}": entry.git_commit,
+        f"cwd{suffix}": entry.cwd,
+        f"user_id{suffix}": str(auth.user_id),
+        # Prefer per-entry source provenance (originating device) over
+        # request-level device info (uploading device). They differ when a DB is
+        # copied/restored before sync.
+        f"device_id{suffix}": entry.source_device_id or (device.machine_id if device else None),
+        f"device_name{suffix}": entry.source_device_name
+        or (device.machine_name if device else None),
+        f"created_at{suffix}": entry.created_at,
+        f"updated_at{suffix}": entry.updated_at,
+    }
+
+
+def _entry_values_sql(suffix: str) -> str:
+    return (
+        f"(:id{suffix}, :transcript_id{suffix}, :project_id{suffix},"
+        f" :session_id{suffix}, :provider{suffix}, :kind{suffix},"
+        f" :timestamp{suffix}, :content{suffix}, :content_sha256{suffix},"
+        f" :display_in_timeline{suffix},"
+        f" :git_branch{suffix}, :git_commit{suffix}, :cwd{suffix},"
+        f" :user_id{suffix}, :device_id{suffix}, :device_name{suffix},"
+        f" :created_at{suffix}, :updated_at{suffix})"
+    )
+
+
+def _insert_entries_sql(schema: str, values_sql: str) -> str:
+    return f"""
+        INSERT INTO {schema}.transcript_entries
+            (id, transcript_id, project_id, session_id, provider, kind,
+             timestamp, content, content_sha256, display_in_timeline,
+             git_branch, git_commit, cwd, uploaded_by_user_id,
+             uploaded_by_device_id, uploaded_by_device_name,
+             created_at, updated_at)
+        VALUES {values_sql}
+        ON CONFLICT (id) DO NOTHING
+    """
+
+
 @router.post("/push", response_model=SyncPushResponse)
 async def sync_push(
     http_request: HttpRequest,
@@ -305,13 +366,14 @@ async def sync_push(
         # than 1 minute. These are leftovers from requests that failed
         # (413, 500, etc.) before marking complete, blocking retries.
         try:
-            await db.execute(
-                text(
-                    "DELETE FROM public.sync_idempotency "
-                    "WHERE is_complete = false "
-                    "AND created_at < NOW() - INTERVAL '1 minute'"
+            async with db.begin_nested():
+                await db.execute(
+                    text(
+                        "DELETE FROM public.sync_idempotency "
+                        "WHERE is_complete = false "
+                        "AND created_at < NOW() - INTERVAL '1 minute'"
+                    )
                 )
-            )
         except Exception:
             pass  # Best-effort cleanup
         # Try advisory lock for fail-fast on exact concurrent duplicates.
@@ -333,14 +395,18 @@ async def sync_push(
             )
 
         # Atomically insert-if-not-exists via ON CONFLICT DO NOTHING
-        stmt = pg_insert(SyncIdempotency).values(
-            tenant_id=auth.tenant_id,
-            key_id=auth.key_id,
-            idempotency_key=request.idempotency_key,
-            request_sha256=request_sha,
-            expires_at=datetime.now(UTC) + timedelta(hours=settings.idempotency_ttl_hours),
-        ).on_conflict_do_nothing(
-            constraint="uq_idempotency_key",
+        stmt = (
+            pg_insert(SyncIdempotency)
+            .values(
+                tenant_id=auth.tenant_id,
+                key_id=auth.key_id,
+                idempotency_key=request.idempotency_key,
+                request_sha256=request_sha,
+                expires_at=datetime.now(UTC) + timedelta(hours=settings.idempotency_ttl_hours),
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_idempotency_key",
+            )
         )
         result = await db.execute(stmt)
         await db.flush()
@@ -368,7 +434,9 @@ async def sync_push(
                 if existing_row.is_complete and existing_row.response_json:
                     logger.info(
                         "Idempotent replay: tenant=%s key_id=%s idem_key=%s",
-                        auth.tenant_id, auth.key_id, request.idempotency_key,
+                        auth.tenant_id,
+                        auth.key_id,
+                        request.idempotency_key,
                     )
                     return SyncPushResponse.model_validate_json(existing_row.response_json)
                 if not existing_row.is_complete:
@@ -414,8 +482,7 @@ async def sync_push(
         raise HTTPException(
             status_code=413,
             detail=(
-                f"Batch too large: {total_items} items "
-                f"exceeds limit of {settings.max_batch_size}."
+                f"Batch too large: {total_items} items exceeds limit of {settings.max_batch_size}."
             ),
         )
     if request.entries_sent is not None and request.entries_sent != len(request.entries):
@@ -424,6 +491,7 @@ async def sync_push(
         # under normal operation. Surface to Sentry explicitly so
         # operators can correlate client bugs across releases.
         from contextify_cloud import monitoring as _monitoring
+
         _monitoring.capture_handled_operational_response(
             request=http_request,
             status_code=422,
@@ -441,9 +509,7 @@ async def sync_push(
             ),
         )
     entries_sent_total = (
-        request.entries_sent
-        if request.entries_sent is not None
-        else len(request.entries)
+        request.entries_sent if request.entries_sent is not None else len(request.entries)
     )
 
     # ct-1841: per-entry validation MUST run before any downstream code touches
@@ -462,9 +528,7 @@ async def sync_push(
     from contextify_cloud import monitoring as _monitoring  # local import; avoids cycles
 
     raw_entries: list[Any] = list(request.entries)
-    spec = _build_entry_partial_accept_spec(
-        capture=_monitoring.capture_sync_item_validation
-    )
+    spec = _build_entry_partial_accept_spec(capture=_monitoring.capture_sync_item_validation)
     helper_result = validate_items(
         raw_items=raw_entries,
         spec=spec,
@@ -484,8 +548,11 @@ async def sync_push(
         if original_index is None:
             # `id` may have been duplicated; recover by linear search.
             original_index = next(
-                (i for i, r in enumerate(raw_entries)
-                 if isinstance(r, dict) and r.get("id") == entry.id),
+                (
+                    i
+                    for i, r in enumerate(raw_entries)
+                    if isinstance(r, dict) and r.get("id") == entry.id
+                ),
                 0,
             )
         post_err = _verify_entry_size_and_sha(entry, original_index)
@@ -701,9 +768,7 @@ async def sync_push(
         def _proj_name(p: Any) -> str:
             return (p.name or "").strip()
 
-        allowed_project_ids = {
-            p.id for p in original_projects if _proj_name(p) in allowed_set
-        }
+        allowed_project_ids = {p.id for p in original_projects if _proj_name(p) in allowed_set}
 
         # Filter projects (by name, handle None names safely)
         blocked_projects = [
@@ -747,9 +812,8 @@ async def sync_push(
                 else:
                     # Project doesn't exist in DB at all
                     unknown_project_ids.add(pid)
-        blocked_project_ids = (
-            (provided_project_ids - allowed_project_ids)
-            | (missing_from_batch - allowed_project_ids)
+        blocked_project_ids = (provided_project_ids - allowed_project_ids) | (
+            missing_from_batch - allowed_project_ids
         )
 
         # Filter payload components by *allowed* project IDs.
@@ -766,7 +830,8 @@ async def sync_push(
         request.usage = [u for u in request.usage if u.entry_id in allowed_entry_ids]
         request.summaries = [s for s in request.summaries if s.entry_id in allowed_entry_ids]
         request.tool_invocations = [
-            inv for inv in request.tool_invocations
+            inv
+            for inv in request.tool_invocations
             if (inv.entry_id in allowed_entry_ids) or (inv.transcript_id in allowed_transcript_ids)
         ]
         request.transcript_metadata = [
@@ -814,7 +879,8 @@ async def sync_push(
             )
             if existing_by_id.scalar_one_or_none() is not None:
                 # Project exists by ID, do a normal update
-                await db.execute(text(f"""
+                await db.execute(
+                    text(f"""
                     UPDATE {schema}.projects SET
                         name = :name,
                         root_path = :root_path,
@@ -834,21 +900,23 @@ async def sync_push(
                         repo_name = COALESCE(:repo_name, repo_name),
                         updated_at = :updated_at
                     WHERE id = :id
-                """), {
-                    "id": proj.id,
-                    "name": proj.name,
-                    "root_path": proj.root_path,
-                    "repo_group_key": effective_repo_group_key,
-                    "repo_identity": proj.repo_identity,
-                    "repo_origin_normalized": normalized_repo_origin,
-                    "git_common_dir": proj.git_common_dir,
-                    "is_worktree": proj.is_worktree,
-                    "default_branch": proj.default_branch,
-                    "vcs_provider": proj.vcs_provider,
-                    "worktree_name": proj.worktree_name,
-                    "repo_name": proj.repo_name,
-                    "updated_at": now_epoch,
-                })
+                """),
+                    {
+                        "id": proj.id,
+                        "name": proj.name,
+                        "root_path": proj.root_path,
+                        "repo_group_key": effective_repo_group_key,
+                        "repo_identity": proj.repo_identity,
+                        "repo_origin_normalized": normalized_repo_origin,
+                        "git_common_dir": proj.git_common_dir,
+                        "is_worktree": proj.is_worktree,
+                        "default_branch": proj.default_branch,
+                        "vcs_provider": proj.vcs_provider,
+                        "worktree_name": proj.worktree_name,
+                        "repo_name": proj.repo_name,
+                        "updated_at": now_epoch,
+                    },
+                )
                 await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
                 accepted += 1
                 continue
@@ -870,10 +938,13 @@ async def sync_push(
                     project_id_remap[proj.id] = canonical_id
                     logger.info(
                         "Project identity merge: %s -> %s (repo_group_key=%s)",
-                        proj.id, canonical_id, effective_repo_group_key,
+                        proj.id,
+                        canonical_id,
+                        effective_repo_group_key,
                     )
                     # Update the canonical project's metadata
-                    await db.execute(text(f"""
+                    await db.execute(
+                        text(f"""
                         UPDATE {schema}.projects SET
                             name = COALESCE(:name, name),
                             repo_identity = COALESCE(:repo_identity, repo_identity),
@@ -891,25 +962,28 @@ async def sync_push(
                             repo_name = COALESCE(:repo_name, repo_name),
                             updated_at = :updated_at
                         WHERE id = :canonical_id
-                    """), {
-                        "canonical_id": canonical_id,
-                        "name": proj.name,
-                        "repo_identity": proj.repo_identity,
-                        "repo_origin_normalized": normalized_repo_origin,
-                        "git_common_dir": proj.git_common_dir,
-                        "is_worktree": proj.is_worktree,
-                        "default_branch": proj.default_branch,
-                        "vcs_provider": proj.vcs_provider,
-                        "worktree_name": proj.worktree_name,
-                        "repo_name": proj.repo_name,
-                        "updated_at": now_epoch,
-                    })
+                    """),
+                        {
+                            "canonical_id": canonical_id,
+                            "name": proj.name,
+                            "repo_identity": proj.repo_identity,
+                            "repo_origin_normalized": normalized_repo_origin,
+                            "git_common_dir": proj.git_common_dir,
+                            "is_worktree": proj.is_worktree,
+                            "default_branch": proj.default_branch,
+                            "vcs_provider": proj.vcs_provider,
+                            "worktree_name": proj.worktree_name,
+                            "repo_name": proj.repo_name,
+                            "updated_at": now_epoch,
+                        },
+                    )
                     await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
                     accepted += 1
                     continue
 
             # Genuinely new project, insert it
-            await db.execute(text(f"""
+            await db.execute(
+                text(f"""
                 INSERT INTO {schema}.projects
                     (
                         id, name, root_path, repo_group_key, repo_identity,
@@ -923,23 +997,25 @@ async def sync_push(
                     :git_common_dir, :is_worktree, :default_branch, :vcs_provider,
                     :worktree_name, :repo_name, :user_id, :created_at, :updated_at
                 )
-            """), {
-                "id": proj.id,
-                "name": proj.name,
-                "root_path": proj.root_path,
-                "repo_group_key": effective_repo_group_key,
-                "repo_identity": proj.repo_identity,
-                "repo_origin_normalized": normalized_repo_origin,
-                "git_common_dir": proj.git_common_dir,
-                "is_worktree": proj.is_worktree,
-                "default_branch": proj.default_branch,
-                "vcs_provider": proj.vcs_provider,
-                "worktree_name": proj.worktree_name,
-                "repo_name": proj.repo_name,
-                "user_id": str(auth.user_id),
-                "created_at": now_epoch,
-                "updated_at": now_epoch,
-            })
+            """),
+                {
+                    "id": proj.id,
+                    "name": proj.name,
+                    "root_path": proj.root_path,
+                    "repo_group_key": effective_repo_group_key,
+                    "repo_identity": proj.repo_identity,
+                    "repo_origin_normalized": normalized_repo_origin,
+                    "git_common_dir": proj.git_common_dir,
+                    "is_worktree": proj.is_worktree,
+                    "default_branch": proj.default_branch,
+                    "vcs_provider": proj.vcs_provider,
+                    "worktree_name": proj.worktree_name,
+                    "repo_name": proj.repo_name,
+                    "user_id": str(auth.user_id),
+                    "created_at": now_epoch,
+                    "updated_at": now_epoch,
+                },
+            )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -977,25 +1053,32 @@ async def sync_push(
                 "created_at": tx.created_at,
                 "updated_at": tx.updated_at,
             }
-            existing_by_id = await db.execute(text(f"""
+            existing_by_id = await db.execute(
+                text(f"""
                 SELECT id FROM {schema}.transcripts
                 WHERE id = :id
-            """), tx_params)
+            """),
+                tx_params,
+            )
             canonical_transcript_id = existing_by_id.scalar_one_or_none()
 
             if canonical_transcript_id is None:
-                existing_by_path = await db.execute(text(f"""
+                existing_by_path = await db.execute(
+                    text(f"""
                     SELECT id FROM {schema}.transcripts
                     WHERE project_id = :project_id
                       AND file_path = :file_path
                       AND uploaded_by_user_id = :user_id
-                """), tx_params)
+                """),
+                    tx_params,
+                )
                 canonical_transcript_id = existing_by_path.scalar_one_or_none()
 
             if canonical_transcript_id is not None:
                 if canonical_transcript_id != tx.id:
                     transcript_id_remap[tx.id] = canonical_transcript_id
-                await db.execute(text(f"""
+                await db.execute(
+                    text(f"""
                     UPDATE {schema}.transcripts
                     SET provider = :provider,
                         provider_session_id = :provider_session_id,
@@ -1003,15 +1086,20 @@ async def sync_push(
                         line_count = :line_count,
                         updated_at = :updated_at
                     WHERE id = :canonical_id
-                """), {**tx_params, "canonical_id": canonical_transcript_id})
+                """),
+                    {**tx_params, "canonical_id": canonical_transcript_id},
+                )
             else:
-                await db.execute(text(f"""
+                await db.execute(
+                    text(f"""
                     INSERT INTO {schema}.transcripts
                         (id, project_id, file_path, provider, provider_session_id,
                          uploaded_by_user_id, device_id, line_count, created_at, updated_at)
                     VALUES (:id, :project_id, :file_path, :provider, :provider_session_id,
                             :user_id, :device_id, :line_count, :created_at, :updated_at)
-                """), tx_params)
+                """),
+                    tx_params,
+                )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -1101,29 +1189,29 @@ async def sync_push(
                         f"(existing sha: {existing_map[entry.id][:16]}..., "
                         f"new sha: {entry.content_sha256[:16]}...)"
                     )
-                    item_errors.append(SyncItemError(
-                        item_kind="entry",
-                        item_id=entry.id,
-                        error_code="ENTRY_CONFLICT",
-                        retryable=False,
-                        detail=(
-                            f"entry exists with different content "
-                            f"(existing sha {existing_map[entry.id][:16]}..., "
-                            f"new sha {entry.content_sha256[:16]}...)"
-                        ),
-                    ))
+                    item_errors.append(
+                        SyncItemError(
+                            item_kind="entry",
+                            item_id=entry.id,
+                            error_code="ENTRY_CONFLICT",
+                            retryable=False,
+                            detail=(
+                                f"entry exists with different content "
+                                f"(existing sha {existing_map[entry.id][:16]}..., "
+                                f"new sha {entry.content_sha256[:16]}...)"
+                            ),
+                        )
+                    )
             else:
                 new_entries.append(entry)
 
-        # Phase 2: Single bulk INSERT with per-batch SAVEPOINT
+        # Phase 2: Bulk INSERT with per-batch SAVEPOINT and per-row fallback.
         # Note: ON CONFLICT DO NOTHING means concurrent pushes of the same
         # new entry result in a lower rowcount (silent skip) rather than a
         # duplicate count. Data is safe; the client may see fewer accepted
         # entries than expected but can retry safely.
-        # Note: If the bulk INSERT fails, all new_entries are counted as
-        # retriable failures with a single aggregated error message (vs
-        # per-entry errors in the old loop). This trades diagnostic detail
-        # for O(1) SQL round trips.
+        # If the bulk INSERT fails, row-level savepoints keep one poison row
+        # from stalling the rest of the batch.
         if new_entries:
             sp = "sp_entries_batch"
             try:
@@ -1133,65 +1221,23 @@ async def sync_push(
                 entry_sub_batch = 1000
                 total_inserted = 0
                 for batch_start in range(0, len(new_entries), entry_sub_batch):
-                    batch = new_entries[batch_start:batch_start + entry_sub_batch]
+                    batch = new_entries[batch_start : batch_start + entry_sub_batch]
                     value_rows = []
                     params: dict[str, object] = {}
                     for j, entry in enumerate(batch):
                         suffix = f"_{j}"
-                        value_rows.append(
-                            f"(:id{suffix}, :transcript_id{suffix}, :project_id{suffix},"
-                            f" :session_id{suffix}, :provider{suffix}, :kind{suffix},"
-                            f" :timestamp{suffix}, :content{suffix}, :content_sha256{suffix},"
-                            f" :display_in_timeline{suffix},"
-                            f" :git_branch{suffix}, :git_commit{suffix}, :cwd{suffix},"
-                            f" :user_id{suffix}, :device_id{suffix}, :device_name{suffix},"
-                            f" :created_at{suffix}, :updated_at{suffix})"
+                        value_rows.append(_entry_values_sql(suffix))
+                        params.update(
+                            _entry_insert_params(
+                                entry,
+                                suffix=suffix,
+                                auth=auth,
+                                device=device,
+                            )
                         )
-                        params.update({
-                            f"id{suffix}": entry.id,
-                            f"transcript_id{suffix}": entry.transcript_id,
-                            f"project_id{suffix}": entry.project_id,
-                            f"session_id{suffix}": entry.session_id,
-                            f"provider{suffix}": entry.provider,
-                            f"kind{suffix}": entry.kind,
-                            f"timestamp{suffix}": entry.timestamp,
-                            # ct-1841: chunked entries arrive with `content` unset
-                            # and content split into `content_chunks`. Materialize
-                            # back to a single string here so the INSERT sees one
-                            # logical row regardless of the transport shape.
-                            f"content{suffix}": entry.materialized_content(),
-                            f"content_sha256{suffix}": entry.content_sha256,
-                            f"display_in_timeline{suffix}": entry.display_in_timeline,
-                            f"git_branch{suffix}": entry.git_branch,
-                            f"git_commit{suffix}": entry.git_commit,
-                            f"cwd{suffix}": entry.cwd,
-                            f"user_id{suffix}": str(auth.user_id),
-                            # Prefer per-entry source provenance (originating device) over
-                            # request-level device info (uploading device). They differ
-                            # when a DB is copied/restored before sync.
-                            f"device_id{suffix}": (
-                                entry.source_device_id
-                                or (device.machine_id if device else None)
-                            ),
-                            f"device_name{suffix}": (
-                                entry.source_device_name
-                                or (device.machine_name if device else None)
-                            ),
-                            f"created_at{suffix}": entry.created_at,
-                            f"updated_at{suffix}": entry.updated_at,
-                        })
                     values_sql = ",\n                        ".join(value_rows)
                     result = await db.execute(
-                        text(f"""
-                            INSERT INTO {schema}.transcript_entries
-                                (id, transcript_id, project_id, session_id, provider, kind,
-                                 timestamp, content, content_sha256, display_in_timeline,
-                                 git_branch, git_commit, cwd, uploaded_by_user_id,
-                                 uploaded_by_device_id, uploaded_by_device_name,
-                                 created_at, updated_at)
-                            VALUES {values_sql}
-                            ON CONFLICT (id) DO NOTHING
-                        """),
+                        text(_insert_entries_sql(schema, values_sql)),
                         params,
                     )
                     total_inserted += result.rowcount  # type: ignore[attr-defined]
@@ -1200,34 +1246,89 @@ async def sync_push(
                 await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             except Exception as e:
                 await _rollback_savepoint(db, sp)
-                entries_retriable_failed += len(new_entries)
-                error_codes.add("ENTRY_RETRYABLE_DB")
-                errors.append(
-                    f"Batch entry insert ({len(new_entries)} entries): {e}"
-                )
+                batch_insert_error = str(e)
+                consecutive_row_failures = 0
+                fallback_item_errors_emitted = 0
+                batch_fallback_reported = False
+                for i, entry in enumerate(new_entries):
+                    if consecutive_row_failures >= 5:
+                        remaining = len(new_entries) - i
+                        entries_retriable_failed += remaining
+                        error_codes.add("ENTRY_RETRYABLE_DB")
+                        errors.append(
+                            "Per-row entry insert fallback stopped after repeated "
+                            f"failures; {remaining} entries marked retryable."
+                        )
+                        break
+
+                    row_sp = f"sp_entry_fallback_{i}"
+                    try:
+                        await db.execute(text(f"SAVEPOINT {row_sp}"))
+                        result = await db.execute(
+                            text(_insert_entries_sql(schema, _entry_values_sql(""))),
+                            _entry_insert_params(
+                                entry,
+                                suffix="",
+                                auth=auth,
+                                device=device,
+                            ),
+                        )
+                        inserted = result.rowcount  # type: ignore[attr-defined]
+                        entries_accepted += inserted
+                        accepted += inserted
+                        await db.execute(text(f"RELEASE SAVEPOINT {row_sp}"))
+                        consecutive_row_failures = 0
+                    except Exception as row_error:
+                        await _rollback_savepoint(db, row_sp)
+                        consecutive_row_failures += 1
+                        entries_retriable_failed += 1
+                        error_codes.add("ENTRY_RETRYABLE_DB")
+                        if not batch_fallback_reported:
+                            batch_fallback_reported = True
+                            errors.append(
+                                f"Batch entry insert ({len(new_entries)} entries) "
+                                f"fell back to per-row insert: {batch_insert_error}"
+                            )
+                        if fallback_item_errors_emitted < 10:
+                            fallback_item_errors_emitted += 1
+                            errors.append(
+                                f"Entry {entry.id}: retryable DB insert failure: {row_error}"
+                            )
+                            item_errors.append(
+                                SyncItemError(
+                                    item_kind="entry",
+                                    item_id=entry.id,
+                                    error_code="ENTRY_RETRYABLE_DB",
+                                    retryable=True,
+                                    detail="retryable database insert failure",
+                                )
+                            )
 
     # Upsert summaries
     for i, summary in enumerate(request.summaries):
         sp = f"sp_sum_{i}"
         try:
             await db.execute(text(f"SAVEPOINT {sp}"))
-            await db.execute(text(f"""
+            await db.execute(
+                text(f"""
                 INSERT INTO {schema}.timeline_summaries
                     (id, entry_id, content_sha256, window_sha256,
                      present_form, past_form, disposition, generated_at)
                 VALUES (:id, :entry_id, :content_sha256, :window_sha256,
                         :present_form, :past_form, :disposition, :generated_at)
                 ON CONFLICT (content_sha256, window_sha256) DO NOTHING
-            """), {
-                "id": str(uuid.uuid4()),
-                "entry_id": summary.entry_id,
-                "content_sha256": summary.content_sha256,
-                "window_sha256": summary.window_sha256,
-                "present_form": summary.present_form,
-                "past_form": summary.past_form,
-                "disposition": summary.disposition,
-                "generated_at": summary.generated_at,
-            })
+            """),
+                {
+                    "id": str(uuid.uuid4()),
+                    "entry_id": summary.entry_id,
+                    "content_sha256": summary.content_sha256,
+                    "window_sha256": summary.window_sha256,
+                    "present_form": summary.present_form,
+                    "past_form": summary.past_form,
+                    "disposition": summary.disposition,
+                    "generated_at": summary.generated_at,
+                },
+            )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -1239,22 +1340,25 @@ async def sync_push(
         sp = f"sp_usage_{i}"
         try:
             await db.execute(text(f"SAVEPOINT {sp}"))
-            await db.execute(text(f"""
+            await db.execute(
+                text(f"""
                 INSERT INTO {schema}.assistant_usage
                     (entry_id, request_id, model, input_tokens, output_tokens,
                      cache_creation_tokens, cache_read_tokens)
                 VALUES (:entry_id, :request_id, :model, :input_tokens, :output_tokens,
                         :cache_creation_tokens, :cache_read_tokens)
                 ON CONFLICT (entry_id, request_id) DO NOTHING
-            """), {
-                "entry_id": usage.entry_id,
-                "request_id": usage.request_id,
-                "model": usage.model,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_creation_tokens": usage.cache_creation_tokens,
-                "cache_read_tokens": usage.cache_read_tokens,
-            })
+            """),
+                {
+                    "entry_id": usage.entry_id,
+                    "request_id": usage.request_id,
+                    "model": usage.model,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_tokens": usage.cache_creation_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                },
+            )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -1266,26 +1370,29 @@ async def sync_push(
         sp = f"sp_inv_{i}"
         try:
             await db.execute(text(f"SAVEPOINT {sp}"))
-            await db.execute(text(f"""
+            await db.execute(
+                text(f"""
                 INSERT INTO {schema}.tool_invocations
                     (id, entry_id, transcript_id, tool_name, tool_key, status,
                      started_at, completed_at, metadata_json, created_at, updated_at)
                 VALUES (:id, :entry_id, :transcript_id, :tool_name, :tool_key, :status,
                         :started_at, :completed_at, :metadata_json, :created_at, :updated_at)
                 ON CONFLICT (id) DO NOTHING
-            """), {
-                "id": inv.id,
-                "entry_id": inv.entry_id,
-                "transcript_id": inv.transcript_id,
-                "tool_name": inv.tool_name,
-                "tool_key": inv.tool_key,
-                "status": inv.status,
-                "started_at": inv.started_at,
-                "completed_at": inv.completed_at,
-                "metadata_json": json.dumps(inv.metadata_json) if inv.metadata_json else None,
-                "created_at": inv.created_at,
-                "updated_at": inv.updated_at,
-            })
+            """),
+                {
+                    "id": inv.id,
+                    "entry_id": inv.entry_id,
+                    "transcript_id": inv.transcript_id,
+                    "tool_name": inv.tool_name,
+                    "tool_key": inv.tool_key,
+                    "status": inv.status,
+                    "started_at": inv.started_at,
+                    "completed_at": inv.completed_at,
+                    "metadata_json": json.dumps(inv.metadata_json) if inv.metadata_json else None,
+                    "created_at": inv.created_at,
+                    "updated_at": inv.updated_at,
+                },
+            )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -1297,7 +1404,8 @@ async def sync_push(
         sp = f"sp_meta_{i}"
         try:
             await db.execute(text(f"SAVEPOINT {sp}"))
-            await db.execute(text(f"""
+            await db.execute(
+                text(f"""
                 INSERT INTO {schema}.transcript_metadata
                     (transcript_id, project_id, title, description, topics,
                      confidence, generated_at, model, created_at, updated_at)
@@ -1308,18 +1416,20 @@ async def sync_push(
                     description = EXCLUDED.description,
                     topics = EXCLUDED.topics,
                     updated_at = EXCLUDED.updated_at
-            """), {
-                "transcript_id": meta.transcript_id,
-                "project_id": meta.project_id,
-                "title": meta.title,
-                "description": meta.description,
-                "topics": json.dumps(meta.topics),
-                "confidence": meta.confidence,
-                "generated_at": meta.generated_at,
-                "model": meta.model,
-                "created_at": meta.created_at,
-                "updated_at": meta.updated_at,
-            })
+            """),
+                {
+                    "transcript_id": meta.transcript_id,
+                    "project_id": meta.project_id,
+                    "title": meta.title,
+                    "description": meta.description,
+                    "topics": json.dumps(meta.topics),
+                    "confidence": meta.confidence,
+                    "generated_at": meta.generated_at,
+                    "model": meta.model,
+                    "created_at": meta.created_at,
+                    "updated_at": meta.updated_at,
+                },
+            )
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
         except Exception as e:
@@ -1342,10 +1452,7 @@ async def sync_push(
     # are still removed, so retention semantics are preserved.
     retention_days = get_effective_history_retention_days(tenant_obj)
     if retention_days > 0:
-        retention_cutoff = int(
-            (datetime.now(UTC) - timedelta(days=retention_days))
-            .timestamp()
-        )
+        retention_cutoff = int((datetime.now(UTC) - timedelta(days=retention_days)).timestamp())
         try:
             # ct-2028 (review iter-01): run the retention DELETE inside a SAVEPOINT
             # so a statement failure rolls back only the nested transaction. On
@@ -1374,9 +1481,10 @@ async def sync_push(
                 cleaned_count = cleanup_result.rowcount  # type: ignore[attr-defined]
             if cleaned_count > 0:
                 logger.info(
-                    "Data retention cleanup: deleted %d entries older than %d days "
-                    "for tenant=%s",
-                    cleaned_count, retention_days, auth.tenant_id,
+                    "Data retention cleanup: deleted %d entries older than %d days for tenant=%s",
+                    cleaned_count,
+                    retention_days,
+                    auth.tenant_id,
                 )
         except Exception:
             logger.warning(
@@ -1418,7 +1526,7 @@ async def sync_push(
         tenant_id=auth.tenant_id,
         user_id=auth.user_id,
         event_type="sync_push",
-        entry_count=accepted,
+        entry_count=entries_accepted,
     )
     db.add(usage_event)
 
@@ -1453,7 +1561,11 @@ async def sync_push(
 
     logger.info(
         "Sync push: tenant=%s user=%s accepted=%d duplicates=%d errors=%d blocked=%d",
-        auth.tenant_id, auth.user_id, accepted, duplicates, len(errors),
+        auth.tenant_id,
+        auth.user_id,
+        accepted,
+        duplicates,
+        len(errors),
         len(blocked_projects),
     )
 
@@ -1464,16 +1576,12 @@ async def sync_push(
         + entries_blocked_policy
         + entries_permanent_failed  # ct-1841: permanent failures count as resolved
     )
-    checkpoint_safe = (
-        entries_retriable_failed == 0 and entries_resolved == entries_sent_total
-    )
+    checkpoint_safe = entries_retriable_failed == 0 and entries_resolved == entries_sent_total
     # ct-1841: permanent failures (oversized, sha mismatch, malformed) bubble
     # up as needs_attention so the client surfaces them in the skipped-entries
     # row, but they do NOT mark the batch `blocked` -- only retriable failures
     # block. Permanent-only batches resolve as `completed_with_issues`.
-    needs_attention_count = (
-        entries_conflicted + entries_blocked_policy + entries_permanent_failed
-    )
+    needs_attention_count = entries_conflicted + entries_blocked_policy + entries_permanent_failed
     completion_state: Literal["in_progress", "success", "completed_with_issues", "blocked"]
     if entries_retriable_failed > 0:
         completion_state = "blocked"
@@ -1486,9 +1594,8 @@ async def sync_push(
 
     completed_batch_increment = 1 if checkpoint_safe else 0
     next_completed_batches = (
-        (sync_session_obj.completed_batches if sync_session_obj else 0)
-        + completed_batch_increment
-    )
+        sync_session_obj.completed_batches if sync_session_obj else 0
+    ) + completed_batch_increment
     effective_total_batches = (
         sync_session_obj.total_batches
         if sync_session_obj and sync_session_obj.total_batches is not None
@@ -1598,36 +1705,44 @@ async def sync_push(
         project_id_remapped=project_id_remap,
     )
 
-    # Store idempotency response for future replay
+    # Store only resolved idempotency responses for future replay. Retryable
+    # blocked/in-progress responses are not stable outcomes; clear the guard row
+    # so same-key client retries can reprocess immediately.
     if request.idempotency_key:
-        await db.execute(
-            update(SyncIdempotency)
-            .where(
-                SyncIdempotency.tenant_id == auth.tenant_id,
-                SyncIdempotency.key_id == auth.key_id,
-                SyncIdempotency.idempotency_key == request.idempotency_key,
-            )
-            .values(
-                is_complete=True,
-                response_json=response.model_dump_json(),
-            )
+        idempotency_filter = (
+            (SyncIdempotency.tenant_id == auth.tenant_id)
+            & (SyncIdempotency.key_id == auth.key_id)
+            & (SyncIdempotency.idempotency_key == request.idempotency_key)
         )
+        if completion_state in {"success", "completed_with_issues"}:
+            await db.execute(
+                update(SyncIdempotency)
+                .where(idempotency_filter)
+                .values(
+                    is_complete=True,
+                    response_json=response.model_dump_json(),
+                )
+            )
+        elif completion_state in {"blocked", "in_progress"}:
+            await db.execute(delete(SyncIdempotency).where(idempotency_filter))
+        # Unresolved outcomes are not stable replay results.
 
     # Opportunistic cleanup of expired idempotency records (~5% of requests).
     # Lightweight alternative to a dedicated background job. Deletes at most
     # 100 expired rows per invocation to avoid holding locks.
     if random.random() < 0.05:
         try:
-            cleanup_result = await db.execute(
-                text(
-                    "DELETE FROM sync_idempotency "
-                    "WHERE id IN ("
-                    "  SELECT id FROM sync_idempotency "
-                    "  WHERE expires_at < now() "
-                    "  LIMIT 100"
-                    ")"
+            async with db.begin_nested():
+                cleanup_result = await db.execute(
+                    text(
+                        "DELETE FROM sync_idempotency "
+                        "WHERE id IN ("
+                        "  SELECT id FROM sync_idempotency "
+                        "  WHERE expires_at < now() "
+                        "  LIMIT 100"
+                        ")"
+                    )
                 )
-            )
             cleaned = cleanup_result.rowcount  # type: ignore[attr-defined]
             if cleaned > 0:
                 logger.info("Idempotency cleanup: deleted %d expired rows", cleaned)
@@ -1637,14 +1752,15 @@ async def sync_push(
         # Also clean up stale sync sessions (inactive for > session_ttl_hours).
         try:
             stale_cutoff = datetime.now(UTC) - timedelta(hours=settings.session_ttl_hours)
-            stale_result = await db.execute(
-                update(SyncSession)
-                .where(
-                    SyncSession.status == "in_progress",
-                    SyncSession.last_batch_at < stale_cutoff,
+            async with db.begin_nested():
+                stale_result = await db.execute(
+                    update(SyncSession)
+                    .where(
+                        SyncSession.status == "in_progress",
+                        SyncSession.last_batch_at < stale_cutoff,
+                    )
+                    .values(status="abandoned", completed_at=datetime.now(UTC))
                 )
-                .values(status="abandoned", completed_at=datetime.now(UTC))
-            )
             stale_cleaned = stale_result.rowcount  # type: ignore[attr-defined]
             if stale_cleaned > 0:
                 logger.info("Stale session cleanup: abandoned %d sessions", stale_cleaned)
@@ -1706,18 +1822,14 @@ async def sync_push(
     # confines any such failure, the outer transaction stays committable, and activation
     # analytics genuinely cannot break a sync. emit_funnel_event is fire-and-forget and
     # touches no DB, so it runs AFTER the savepoint, outside the failure boundary.
-    if (
-        device_was_first_sync
-        and not tenant_is_internal(tenant_obj)
-        and funnel_backend_registered()
-    ):
+    if device_was_first_sync and not tenant_is_internal(tenant_obj) and funnel_backend_registered():
         event_payload: dict[str, Any] | None = None
         try:
             async with db.begin_nested():
                 tenant_lock_key = int(
-                    hashlib.sha256(
-                        f"second_device_sync:{auth.tenant_id}".encode()
-                    ).hexdigest()[:15],
+                    hashlib.sha256(f"second_device_sync:{auth.tenant_id}".encode()).hexdigest()[
+                        :15
+                    ],
                     16,
                 )
                 await db.execute(
@@ -1868,7 +1980,8 @@ async def sync_pull(
             skipped += 1
             logger.warning(
                 "Skipping invalid entry %s (server_seq=%s): validation failed",
-                row.id, row.server_sequence,
+                row.id,
+                row.server_sequence,
                 exc_info=True,
             )
             continue
@@ -1887,18 +2000,17 @@ async def sync_pull(
         placeholders = ", ".join(f":p{i}" for i in range(len(project_ids)))
         params = {f"p{i}": pid for i, pid in enumerate(project_ids)}
         proj_result = await db.execute(
-            text(
-                f"SELECT id, name, root_path FROM {schema}.projects "
-                f"WHERE id IN ({placeholders})"
-            ),
+            text(f"SELECT id, name, root_path FROM {schema}.projects WHERE id IN ({placeholders})"),
             params,
         )
         for row in proj_result.fetchall():
-            projects.append(PullProject(
-                id=row.id,
-                name=row.name,
-                root_path=row.root_path,
-            ))
+            projects.append(
+                PullProject(
+                    id=row.id,
+                    name=row.name,
+                    root_path=row.root_path,
+                )
+            )
 
     # Fetch referenced transcripts
     transcripts: list[PullTranscript] = []
@@ -1913,12 +2025,14 @@ async def sync_pull(
             params,
         )
         for row in tx_result.fetchall():
-            transcripts.append(PullTranscript(
-                id=row.id,
-                project_id=row.project_id,
-                file_path=row.file_path,
-                provider=row.provider,
-            ))
+            transcripts.append(
+                PullTranscript(
+                    id=row.id,
+                    project_id=row.project_id,
+                    file_path=row.file_path,
+                    provider=row.provider,
+                )
+            )
 
     # Fetch summaries for returned entries
     summaries: list[PullSummary] = []
@@ -1934,12 +2048,14 @@ async def sync_pull(
             params,
         )
         for row in sum_result.fetchall():
-            summaries.append(PullSummary(
-                entry_id=row.entry_id,
-                present_form=row.present_form,
-                past_form=row.past_form,
-                disposition=row.disposition,
-            ))
+            summaries.append(
+                PullSummary(
+                    entry_id=row.entry_id,
+                    present_form=row.present_form,
+                    past_form=row.past_form,
+                    disposition=row.disposition,
+                )
+            )
 
     # Get current high-water mark (max server_sequence overall).
     # Use MAX(server_sequence) instead of sequence last_value because
@@ -1962,7 +2078,13 @@ async def sync_pull(
 
     logger.info(
         "Sync pull: tenant=%s user=%s role=%s entries=%d skipped=%d has_more=%s since=%d",
-        auth.tenant_id, auth.user_id, auth.role, len(entries), skipped, has_more, since,
+        auth.tenant_id,
+        auth.user_id,
+        auth.role,
+        len(entries),
+        skipped,
+        has_more,
+        since,
     )
 
     return SyncPullResponse(
@@ -1984,9 +2106,7 @@ async def sync_status(
     """Get sync status for the authenticated user."""
     now = datetime.now(UTC)
     # Get devices
-    devices_result = await db.execute(
-        select(Device).where(Device.user_id == auth.user_id)
-    )
+    devices_result = await db.execute(select(Device).where(Device.user_id == auth.user_id))
     devices = devices_result.scalars().all()
 
     # Get tenant for schema lookup
@@ -2006,8 +2126,11 @@ async def sync_status(
         # owners/admins see all entries in the tenant).
         scope_clause, scope_params = build_user_scope_clause(auth)
         try:
-            count_sql = f"SELECT COUNT(*) FROM {schema}.transcript_entries WHERE 1=1 {scope_clause}"
-            result = await db.execute(text(count_sql), scope_params)
+            async with db.begin_nested():
+                count_sql = (
+                    f"SELECT COUNT(*) FROM {schema}.transcript_entries WHERE 1=1 {scope_clause}"
+                )
+                result = await db.execute(text(count_sql), scope_params)
             entries_synced = result.scalar() or 0
         except Exception:
             pass  # Schema may not exist yet
@@ -2016,9 +2139,12 @@ async def sync_status(
         # sync_pull above). The global high-water mark is needed for sync
         # convergence. See ct-292 data scoping audit.
         try:
-            max_result = await db.execute(
-                text(f"SELECT COALESCE(MAX(server_sequence), 0) FROM {schema}.transcript_entries")
-            )
+            async with db.begin_nested():
+                max_result = await db.execute(
+                    text(
+                        f"SELECT COALESCE(MAX(server_sequence), 0) FROM {schema}.transcript_entries"
+                    )
+                )
             server_sequence = max_result.scalar() or 0
         except Exception:
             pass  # Schema may not exist yet
@@ -2035,35 +2161,39 @@ async def sync_status(
     try:
         # Compatibility cleanup for older lingering sessions. This read path
         # intentionally mutates state, and get_db() commits on request teardown.
-        await finalize_effectively_complete_sessions(auth, db, now=now)
-        stale_cutoff = datetime.now(UTC) - timedelta(hours=settings.session_ttl_hours)
-        pending_result = await db.execute(
-            select(func.count(SyncSession.id)).where(
-                SyncSession.tenant_id == auth.tenant_id,
-                SyncSession.user_id == auth.user_id,
-                SyncSession.status == "in_progress",
-                SyncSession.last_batch_at >= stale_cutoff,
-                SyncSession.total_batches.is_not(None),
-                SyncSession.total_batches > 1,
-                SyncSession.completed_batches < SyncSession.total_batches,
+        async with db.begin_nested():
+            await finalize_effectively_complete_sessions(auth, db, now=now)
+            stale_cutoff = datetime.now(UTC) - timedelta(hours=settings.session_ttl_hours)
+            pending_result = await db.execute(
+                select(func.count(SyncSession.id)).where(
+                    SyncSession.tenant_id == auth.tenant_id,
+                    SyncSession.user_id == auth.user_id,
+                    SyncSession.status == "in_progress",
+                    SyncSession.last_batch_at >= stale_cutoff,
+                    SyncSession.total_batches.is_not(None),
+                    SyncSession.total_batches > 1,
+                    SyncSession.completed_batches < SyncSession.total_batches,
+                )
             )
-        )
-        pending_batches = pending_result.scalar() or 0
+            pending_batches = pending_result.scalar() or 0
 
-        latest_session_result = await db.execute(
-            select(SyncSession).where(
-                SyncSession.tenant_id == auth.tenant_id,
-                SyncSession.user_id == auth.user_id,
-                SyncSession.status == "in_progress",
-                SyncSession.last_batch_at >= stale_cutoff,
-                SyncSession.total_batches.is_not(None),
-                SyncSession.total_batches > 1,
-                SyncSession.completed_batches < SyncSession.total_batches,
-            ).order_by(
-                SyncSession.last_batch_at.desc(),
-                SyncSession.started_at.desc(),
-            ).limit(1)
-        )
+            latest_session_result = await db.execute(
+                select(SyncSession)
+                .where(
+                    SyncSession.tenant_id == auth.tenant_id,
+                    SyncSession.user_id == auth.user_id,
+                    SyncSession.status == "in_progress",
+                    SyncSession.last_batch_at >= stale_cutoff,
+                    SyncSession.total_batches.is_not(None),
+                    SyncSession.total_batches > 1,
+                    SyncSession.completed_batches < SyncSession.total_batches,
+                )
+                .order_by(
+                    SyncSession.last_batch_at.desc(),
+                    SyncSession.started_at.desc(),
+                )
+                .limit(1)
+            )
         latest_session = latest_session_result.scalar_one_or_none()
         if latest_session:
             if not session_is_bulk_catch_up(
@@ -2085,13 +2215,12 @@ async def sync_status(
 
             # Approximate ETA only when total batch count is available.
             if (
-                entries_total and entries_total > 0
+                entries_total
+                and entries_total > 0
                 and latest_session.started_at
                 and latest_session.completed_batches > 0
             ):
-                elapsed_seconds = max(
-                    1.0, (now - latest_session.started_at).total_seconds()
-                )
+                elapsed_seconds = max(1.0, (now - latest_session.started_at).total_seconds())
                 batches_per_second = latest_session.completed_batches / elapsed_seconds
                 if batches_per_second > 0:
                     remaining = max(0, entries_total - latest_session.completed_batches)

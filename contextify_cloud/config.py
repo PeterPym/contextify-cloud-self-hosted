@@ -26,9 +26,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Database
-    database_url: str = (
-        "postgresql+asyncpg://contextify:contextify@localhost:5432/contextify"
-    )
+    database_url: str = "postgresql+asyncpg://contextify:contextify@localhost:5432/contextify"
 
     # API security
     api_secret_key: str = DEFAULT_API_SECRET_KEY
@@ -124,6 +122,14 @@ class Settings(BaseSettings):
     # Keep disabled until explicit tenant switching exists.
     allow_multi_membership_accounts: bool = False
 
+    # ct-2614 — dedicated hostname the first-party telemetry relay answers on.
+    # nginx fronts one FastAPI app for both cloud.contextify.sh and this host; the
+    # relay route enforces the separation app-side by responding only when the
+    # request Host matches this value (any other host -> 404). Safe to ship in the
+    # source-available mirror (just a hostname); the relay route itself lives under
+    # contextify_cloud/hosted/ and is excluded from the mirror.
+    telemetry_relay_host: str = "telemetry.contextify.sh"
+
     # CORS
     allowed_origins: str = "http://localhost:3000"
     # Comma-separated CIDRs whose X-Forwarded-Proto header is trusted. Loopback
@@ -183,8 +189,15 @@ class Settings(BaseSettings):
     # per-token OTP lockout is enforced inside ``verify_device_otp_attempt``.
     rate_limit_unauth_login_email_link_per_minute: int = 10
     rate_limit_unauth_login_verify_otp_per_minute: int = 10
+    rate_limit_unauth_forgot_password_per_minute: int = 5
     # ct-2340 — per-IP cap on the anonymous checkout endpoints (card-testing surface).
     rate_limit_unauth_checkout_per_minute: int = 5
+    # ct-2614 — per-IP cap on the first-party client-telemetry relay (POST /capture/
+    # on telemetry.contextify.sh). The relayed events are rare per client (first-*
+    # milestones + a weekly heartbeat), so this bounds abuse without throttling the
+    # NAT-shared legitimate traffic. 0 disables the check (CI/E2E).
+    rate_limit_telemetry_per_minute: int = 120
+    password_reset_request_cooldown_seconds: int = 120
 
     # Magic-link / OTP device flow (cloud-magic-link spec §5.3, §10).
     # AuthToken expiry for device-flow magic-link / OTP tokens is 10 minutes.
@@ -267,6 +280,9 @@ class Settings(BaseSettings):
         "rate_limit_unauth_verify_otp_per_minute",
         "rate_limit_unauth_login_email_link_per_minute",
         "rate_limit_unauth_login_verify_otp_per_minute",
+        "rate_limit_unauth_forgot_password_per_minute",
+        "rate_limit_unauth_checkout_per_minute",
+        "rate_limit_telemetry_per_minute",
     )
     @classmethod
     def validate_non_negative_rate_limits(cls, value: int) -> int:
@@ -279,11 +295,12 @@ class Settings(BaseSettings):
         "auth_otp_attempts_per_token_max",
         "auth_email_send_cap_per_device_code",
         "browser_handoff_token_ttl_seconds",
+        "password_reset_request_cooldown_seconds",
     )
     @classmethod
-    def validate_positive_device_flow_settings(cls, value: int) -> int:
+    def validate_positive_auth_flow_settings(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("device-flow integer settings must be >= 1")
+            raise ValueError("auth-flow integer settings must be >= 1")
         return value
 
     @field_validator(
@@ -299,7 +316,25 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [o.strip() for o in self.allowed_origins.split(",")]
+        origins = [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+        for origin in origins:
+            parsed = urlsplit(origin)
+            if (
+                "*" in origin
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "ALLOWED_ORIGINS must be comma-separated absolute http(s) "
+                    "origins without paths/query/fragment/userinfo and must not "
+                    "contain '*' when credentials are enabled."
+                )
+        return origins
 
 
 settings = Settings()

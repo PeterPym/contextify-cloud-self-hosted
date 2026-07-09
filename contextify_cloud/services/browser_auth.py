@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -224,9 +225,7 @@ async def create_auth_token_record(
             # email differs across requests.
             replacement = replacement.where(AuthToken.account_id == account.id)
         else:
-            replacement = replacement.where(
-                AuthToken.email_normalized == normalize_email(email)
-            )
+            replacement = replacement.where(AuthToken.email_normalized == normalize_email(email))
         await db.execute(replacement.values(consumed_at=now))
     token_id = uuid.uuid4()
     raw_token = _raw_token_for_auth_token(token_id, purpose)
@@ -268,8 +267,7 @@ async def _record_auth_token_delivery_result(
         token.delivery_status = "exhausted" if exhausted else "failed"
         token.delivery_sent_at = None
         token.delivery_next_attempt_at = (
-            None if exhausted
-            else now + timedelta(seconds=settings.auth_email_retry_delay_seconds)
+            None if exhausted else now + timedelta(seconds=settings.auth_email_retry_delay_seconds)
         )
         token.delivery_last_error = error_summary
     status = token.delivery_status
@@ -603,9 +601,7 @@ async def _send_auth_token_by_purpose(token: AuthToken, raw_token: str) -> bool:
         # for both immediate sends and outbox retries.
         metadata = token.metadata_json or {}
         is_passwordless = bool(metadata.get("is_passwordless"))
-        return await send_password_reset(
-            token.sent_to, raw_token, is_passwordless=is_passwordless
-        )
+        return await send_password_reset(token.sent_to, raw_token, is_passwordless=is_passwordless)
     if token.purpose == "email_verify":
         return await send_email_verification(token.sent_to, raw_token)
     if token.purpose == "email_change":
@@ -695,8 +691,7 @@ async def run_auth_email_outbox_once(*, batch_limit: int = 50) -> AuthEmailOutbo
             except Exception as exc:
                 await db.rollback()
                 message = (
-                    f"token_id={token_id} purpose={purpose} "
-                    f"error_type={exc.__class__.__name__}"
+                    f"token_id={token_id} purpose={purpose} error_type={exc.__class__.__name__}"
                 )
                 result.errors.append(message)
                 logger.exception("Auth token outbox retry crashed: %s", message)
@@ -733,7 +728,9 @@ async def consume_auth_token(
 
 
 async def peek_password_reset_is_passwordless(
-    db: AsyncSession, *, raw_token: str,
+    db: AsyncSession,
+    *,
+    raw_token: str,
 ) -> bool:
     """Inspect a password-reset token without consuming it.
 
@@ -765,13 +762,42 @@ async def _commit_consumed_token_failure(db: AsyncSession) -> bool:
     return False
 
 
+def _display_name_from_email(email_local: str) -> str:
+    """Human-ish display name derived from an email local-part.
+
+    "jane.smith" -> "Jane Smith"; "j_doe+work" -> "J Doe Work". Falls back to
+    "there" when the local-part yields no usable characters.
+    """
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", email_local) if w]
+    if not words:
+        return "there"
+    return " ".join(w.capitalize() for w in words)
+
+
+async def _generate_unique_tenant_slug(db: AsyncSession, base: str) -> str:
+    """Return a sanitized tenant slug derived from `base`, unique among tenants.
+
+    Probes `base`, `base_2`, `base_3`, ... and falls back to a random suffix if
+    an unreasonable number of collisions occur. `base` is length-capped so the
+    numeric/random suffix survives slug truncation.
+    """
+    root = _sanitize_slug(base)[:48] or "workspace"
+    candidate = root
+    for n in range(2, 10_002):
+        existing = await db.execute(select(Tenant).where(Tenant.slug == candidate))
+        if existing.scalar_one_or_none() is None:
+            return candidate
+        candidate = f"{root}_{n}"
+    return f"{root}_{secrets.token_hex(4)}"
+
+
 async def register_with_password(
     db: AsyncSession,
     *,
     email: str,
     password: str,
-    name: str,
-    team_name: str,
+    name: str = "",
+    team_name: str = "",
     request_ip: str | None,
     user_agent: str | None,
     acquisition_attribution: AcquisitionAttribution | None = None,
@@ -789,10 +815,23 @@ async def register_with_password(
     if existing_account.scalar_one_or_none() is not None:
         raise BrowserAuthError("An account with this email already exists.")
 
-    slug = _sanitize_slug(team_name)
-    existing_tenant = await db.execute(select(Tenant).where(Tenant.slug == slug))
-    if existing_tenant.scalar_one_or_none() is not None:
-        raise BrowserAuthError(f"Team name '{team_name}' is already taken.")
+    # ct-2714: the signup form collects only email + password to minimize
+    # friction. Derive a display name and a unique workspace from the email
+    # local-part when the caller does not supply them; the user renames the
+    # workspace later in onboarding. An explicitly supplied team_name is still
+    # honored and still collision-checked strictly.
+    email_local = normalized.split("@", 1)[0]
+    resolved_name = name.strip() or _display_name_from_email(email_local)
+
+    if team_name.strip():
+        resolved_team_name = team_name.strip()
+        slug = _sanitize_slug(resolved_team_name)
+        existing_tenant = await db.execute(select(Tenant).where(Tenant.slug == slug))
+        if existing_tenant.scalar_one_or_none() is not None:
+            raise BrowserAuthError(f"Team name '{team_name}' is already taken.")
+    else:
+        resolved_team_name = f"{resolved_name}'s Workspace"
+        slug = await _generate_unique_tenant_slug(db, email_local)
 
     now = datetime.now(UTC)
     account = Account(
@@ -812,10 +851,10 @@ async def register_with_password(
 
     tenant, user, _ = await provision_tenant(
         db=db,
-        name=team_name,
+        name=resolved_team_name,
         slug=slug,
         email=email_clean,
-        user_name=name,
+        user_name=resolved_name,
         create_default_api_key=False,
     )
     apply_attribution_to_tenant(tenant, acquisition_attribution)
@@ -946,9 +985,7 @@ async def create_user_session(
 
 async def request_password_reset(db: AsyncSession, *, email: str) -> None:
     normalized = normalize_email(email)
-    result = await db.execute(
-        select(Account).where(Account.email_normalized == normalized)
-    )
+    result = await db.execute(select(Account).where(Account.email_normalized == normalized))
     account = result.scalar_one_or_none()
     if account is None or account.status == "disabled":
         await _lock_auth_token_replacement(
@@ -958,6 +995,28 @@ async def request_password_reset(db: AsyncSession, *, email: str) -> None:
             purpose="password_reset",
         )
         await db.commit()
+        return
+    await _lock_auth_token_replacement(
+        db,
+        account=account,
+        email=account.email_display,
+        purpose="password_reset",
+    )
+    cooldown_cutoff = datetime.now(UTC) - timedelta(
+        seconds=settings.password_reset_request_cooldown_seconds
+    )
+    recent_result = await db.execute(
+        select(AuthToken.id).where(
+            AuthToken.account_id == account.id,
+            AuthToken.purpose == "password_reset",
+            AuthToken.consumed_at.is_(None),
+            AuthToken.created_at > cooldown_cutoff,
+            AuthToken.delivery_status.in_(("pending", "sent", "failed")),
+        )
+    )
+    if recent_result.scalar_one_or_none() is not None:
+        await db.commit()
+        logger.info("Password reset request suppressed by cooldown: account=%s", account.id)
         return
     # Stamp ``is_passwordless`` so the email subject + landing page can
     # adapt copy from "Reset" to "Set" for accounts that have never set a
@@ -1044,12 +1103,14 @@ async def resend_verification(db: AsyncSession, *, account_id: uuid.UUID) -> boo
         seconds=settings.auth_email_resend_cooldown_seconds
     )
     recent = await db.execute(
-        select(AuthToken).where(
+        select(AuthToken)
+        .where(
             AuthToken.account_id == account.id,
             AuthToken.purpose == "email_verify",
             AuthToken.created_at > cooldown_cutoff,
             AuthToken.delivery_status.in_(("pending", "sent")),
-        ).limit(1)
+        )
+        .limit(1)
     )
     if recent.scalar_one_or_none() is not None:
         raise BrowserAuthError("Please wait before requesting another verification email.")
@@ -1262,9 +1323,7 @@ async def set_account_password(
     await db.commit()
     logger.info(
         "event=account_password_set account_id_hash=%s was_passwordless=%s",
-        hashlib.sha256(
-            f"{settings.api_secret_key}:{account.id}".encode()
-        ).hexdigest(),
+        hashlib.sha256(f"{settings.api_secret_key}:{account.id}".encode()).hexdigest(),
         is_passwordless,
     )
 
@@ -1356,9 +1415,7 @@ async def confirm_email_change(db: AsyncSession, *, raw_token: str) -> bool:
     account.email_verified_at = datetime.now(UTC)
     account.session_version += 1
     await db.execute(
-        update(User)
-        .where(User.account_id == account.id)
-        .values(email=account.email_display)
+        update(User).where(User.account_id == account.id).values(email=account.email_display)
     )
     # After identity change, revoke every outstanding account-scoped token so
     # links sent to the old address (reset, verify, change) cannot mutate the
@@ -1654,8 +1711,7 @@ async def _authorize_device_for_session(
     device_auth = locked.scalar_one_or_none()
     if device_auth is None:
         raise BrowserAuthError(
-            "This setup code is no longer active. "
-            "Return to Contextify and start sign-in again."
+            "This setup code is no longer active. Return to Contextify and start sign-in again."
         )
     await db.execute(
         update(DeviceAuthorization)
@@ -2015,16 +2071,12 @@ async def _resolve_signup_account(
         await _commit_consumed_token_failure(db)
         raise BrowserAuthError("This sign-in link is not valid.")
 
-    existing = await db.execute(
-        select(Account).where(Account.email_normalized == normalized)
-    )
+    existing = await db.execute(select(Account).where(Account.email_normalized == normalized))
     account = existing.scalar_one_or_none()
     if account is not None:
         if getattr(account, "status", "active") == "disabled":
             await _commit_consumed_token_failure(db)
-            raise BrowserAuthError(
-                "Account access is unavailable. Contact support."
-            )
+            raise BrowserAuthError("Account access is unavailable. Contact support.")
         user, tenant = await _resolve_owner_user_for_account(db, account=account)
         return account, user, tenant, False
 
@@ -2053,14 +2105,10 @@ async def _resolve_signup_account(
         account = existing_after.scalar_one_or_none()
         if account is None:
             await _commit_consumed_token_failure(db)
-            raise BrowserAuthError(
-                "Sign-in could not be completed. Try again."
-            ) from None
+            raise BrowserAuthError("Sign-in could not be completed. Try again.") from None
         if getattr(account, "status", "active") == "disabled":
             await _commit_consumed_token_failure(db)
-            raise BrowserAuthError(
-                "Account access is unavailable. Contact support."
-            ) from None
+            raise BrowserAuthError("Account access is unavailable. Contact support.") from None
         user, tenant = await _resolve_owner_user_for_account(db, account=account)
         return account, user, tenant, False
 
@@ -2105,8 +2153,7 @@ async def _resolve_login_account(
         # same link after sign-out without seeing "already used".
         await db.rollback()
         raise BrowserAuthError(
-            "You're signed in to a different account in this browser. "
-            "Sign out and try again."
+            "You're signed in to a different account in this browser. Sign out and try again."
         )
 
     user, tenant = await _resolve_owner_user_for_account(db, account=account)
@@ -2148,6 +2195,7 @@ async def _resolve_or_reuse_session(
     )
     # Imported lazily to avoid a circular import at module load time.
     from contextify_cloud.middleware.jwt_auth import create_browser_session_token
+
     session_token = create_browser_session_token(
         account_id=account.id,
         session_id=session.id,

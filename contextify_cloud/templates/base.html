@@ -49,9 +49,15 @@
   <!-- Top navbar -->
   <nav class="navbar navbar-expand-lg ctxf-navbar sticky-top">
     <div class="container-fluid">
+      {% if minimal_chrome is defined and minimal_chrome %}
+      <span class="navbar-brand ctxf-brand ctxf-brand-static">
+        <i class="bi bi-cloud-fill me-2"></i>Contextify
+      </span>
+      {% else %}
       <a class="navbar-brand ctxf-brand" href="/cloud/">
         <i class="bi bi-cloud-fill me-2"></i>Contextify
       </a>
+      {% endif %}
       {% if not (hide_sidebar is defined and hide_sidebar) %}
       <button class="navbar-toggler" type="button"
               data-bs-toggle="collapse" data-bs-target="#sidebarCollapse"
@@ -109,6 +115,7 @@
   </main>
 
   <!-- Footer -->
+  {% if not (minimal_chrome is defined and minimal_chrome) %}
   <footer class="ctxf-footer">
     <div class="container-fluid">
       <div class="row">
@@ -142,6 +149,7 @@
       </p>
     </div>
   </footer>
+  {% endif %}
 
   <!-- Bootstrap JS (vendored) -->
   <script src="/cloud/static/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>

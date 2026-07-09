@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 _registered_endpoint_limits: dict[tuple[str, str], Callable[[], int]] = {}
 
 
-def register_unauth_rate_limit(
-    method: str, path: str, limit_getter: Callable[[], int]
-) -> None:
+def register_unauth_rate_limit(method: str, path: str, limit_getter: Callable[[], int]) -> None:
     """Register a per-IP rate limit for an unauthenticated endpoint.
 
     ``limit_getter`` is called per-request inside ``_get_endpoint_limits`` so a
@@ -59,6 +57,7 @@ def _get_endpoint_limits() -> dict[tuple[str, str], int]:
     limits: dict[tuple[str, str], int] = {
         ("POST", "/cloud/login"): settings.rate_limit_unauth_login_per_minute,
         ("POST", "/cloud/register"): settings.rate_limit_unauth_register_per_minute,
+        ("POST", "/cloud/forgot-password"): (settings.rate_limit_unauth_forgot_password_per_minute),
         ("POST", "/api/v1/auth/device/code"): settings.rate_limit_unauth_device_code_per_minute,
         ("POST", "/api/v1/auth/device/token"): settings.rate_limit_unauth_device_token_per_minute,
         ("POST", "/api/v1/auth/device/email-init"): (
@@ -84,6 +83,7 @@ def _get_endpoint_limits() -> dict[tuple[str, str], int]:
     for key, limit_getter in _registered_endpoint_limits.items():
         limits[key] = limit_getter()
     return limits
+
 
 # In-memory store: {(ip, method, path_pattern): [timestamp1, timestamp2, ...]}
 _unauth_request_log: dict[str, list[float]] = defaultdict(list)
@@ -258,9 +258,7 @@ class UnauthRateLimitMiddleware(BaseHTTPMiddleware):
                 status_code=429,
                 media_type="application/json",
                 headers={
-                    "Retry-After": str(
-                        max(1, math.ceil(WINDOW_SECONDS - (now - timestamps[0])))
-                    )
+                    "Retry-After": str(max(1, math.ceil(WINDOW_SECONDS - (now - timestamps[0]))))
                 },
             )
 
