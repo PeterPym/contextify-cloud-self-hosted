@@ -32,16 +32,19 @@ def _is_token_bearing_cloud_path(path: str) -> bool:
     )
 
 
-def _build_csp(nonce: str) -> str:
+def _build_csp(nonce: str, browser_events_origin: str = "") -> str:
     """Build a Content-Security-Policy with a per-request nonce.
 
     The nonce allows the theme bootstrap <script> in <head> to run
     without ``unsafe-inline``.  All other scripts are served as
     external files from 'self'.
     """
+    external = f" {browser_events_origin}" if browser_events_origin else ""
+    connect_src = f"connect-src 'self'{external}; " if external else ""
     return (
         "default-src 'self'; "
-        f"script-src 'self' 'nonce-{nonce}'; "
+        f"script-src 'self' 'nonce-{nonce}'{external}; "
+        f"{connect_src}"
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "font-src 'self'; "
@@ -74,16 +77,23 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             # templates so they can reference request.state.csp_nonce.
             nonce = secrets.token_urlsafe(16)
             request.state.csp_nonce = nonce
+            request.state.suppress_browser_analytics = _is_token_bearing_cloud_path(path)
 
         response: Response = await call_next(request)
 
         if is_cloud:
+            browser_events_origin = (
+                ""
+                if request.state.suppress_browser_analytics
+                else getattr(request.app.state, "browser_events_origin", "")
+            )
             response.headers["Content-Security-Policy"] = _build_csp(
-                request.state.csp_nonce
+                request.state.csp_nonce,
+                browser_events_origin,
             )
             for name, value in _STATIC_SECURITY_HEADERS.items():
                 response.headers[name] = value
-            if _is_token_bearing_cloud_path(path):
+            if request.state.suppress_browser_analytics:
                 response.headers["Referrer-Policy"] = "no-referrer"
                 response.headers["X-Robots-Tag"] = "noindex, nofollow"
 

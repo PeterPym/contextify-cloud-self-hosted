@@ -509,7 +509,12 @@ def _include_core_routers(app: FastAPI) -> None:
 
 
 def _include_hosted_routers(app: FastAPI) -> None:
-    from contextify_cloud.hosted import funnel_backend, ops_routes, telemetry_relay
+    from contextify_cloud.hosted import (
+        browser_analytics,
+        funnel_backend,
+        ops_routes,
+        telemetry_relay,
+    )
     from contextify_cloud.routers import (
         admin,
         analytics,
@@ -536,6 +541,10 @@ def _include_hosted_routers(app: FastAPI) -> None:
     app.include_router(team.router)
     app.include_router(tenant_admin.router)
     app.include_router(dashboard.router)
+    if settings.browser_analytics_enabled:
+        app.include_router(browser_analytics.router)
+        app.state.browser_analytics_loader_path = browser_analytics.LOADER_PATH
+        app.state.browser_events_origin = browser_analytics.EVENTS_ORIGIN
 
     # ct-2080/ct-2550: register the hosted-only funnel-analytics backend.
     # HOSTED profile must fail closed if capture is not configured; otherwise

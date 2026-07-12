@@ -33,6 +33,12 @@
       window.__ctxfApplyTheme = applyTheme;
     })();
   </script>
+  {% set browser_analytics_loader = request.app.state.browser_analytics_loader_path | default('') %}
+  {% if browser_analytics_loader and not request.state.suppress_browser_analytics | default(false) %}
+  <script src="{{ browser_analytics_loader }}"
+          data-tenant-id="{% if auth is defined and auth %}{{ auth.tenant_id }}{% endif %}"
+          nonce="{{ csp_nonce }}" defer></script>
+  {% endif %}
 
   <!-- Bootstrap 5.3.3 (vendored) -->
   <link href="/cloud/static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">

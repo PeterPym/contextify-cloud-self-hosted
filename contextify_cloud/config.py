@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     github_repo_access_token: str = ""
     enable_docs: bool = False  # Set True locally to enable /api/docs, /api/redoc, /openapi.json
     enable_registration: bool = False  # Public self-serve registration is off by default
+    # Hosted browser analytics is enabled by default. CI/E2E disables it so a
+    # localhost browser never contacts the production first-party event relay.
+    browser_analytics_enabled: bool = True
 
     # JWT session auth (dashboard cookies)
     jwt_token_expire_hours: int = 24
