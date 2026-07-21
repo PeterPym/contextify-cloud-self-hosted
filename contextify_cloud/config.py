@@ -192,6 +192,11 @@ class Settings(BaseSettings):
     # per-token OTP lockout is enforced inside ``verify_device_otp_attempt``.
     rate_limit_unauth_login_email_link_per_minute: int = 10
     rate_limit_unauth_login_verify_otp_per_minute: int = 10
+    # ct-2983 — sister rate limits for the email-first passwordless sign-up
+    # flow. The register POST itself is covered by the existing per-IP
+    # register cap (5/min); these bound the link-confirm + OTP-verify surfaces.
+    rate_limit_unauth_register_email_link_confirm_per_minute: int = 10
+    rate_limit_unauth_register_verify_otp_per_minute: int = 10
     rate_limit_unauth_forgot_password_per_minute: int = 5
     # ct-2340 — per-IP cap on the anonymous checkout endpoints (card-testing surface).
     rate_limit_unauth_checkout_per_minute: int = 5
@@ -201,6 +206,13 @@ class Settings(BaseSettings):
     # NAT-shared legitimate traffic. 0 disables the check (CI/E2E).
     rate_limit_telemetry_per_minute: int = 120
     password_reset_request_cooldown_seconds: int = 120
+    # ct-2983 — shared per-email send cooldown for the BROWSER magic-link INIT
+    # paths (login email-link, register email-first). The device flow is out of
+    # scope here and keeps its own per-device send cap (follow-up ct-3039).
+    # Keyed on ``AuthToken.email_normalized`` (NOT account_id) so existing,
+    # unknown-sentinel, and disabled emails are suppressed identically
+    # (enumeration-safe). 60s matches the client resend countdown; 0 disables.
+    magic_link_send_cooldown_seconds: int = 60
 
     # Magic-link / OTP device flow (cloud-magic-link spec §5.3, §10).
     # AuthToken expiry for device-flow magic-link / OTP tokens is 10 minutes.

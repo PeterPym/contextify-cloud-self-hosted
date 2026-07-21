@@ -59,4 +59,10 @@
       Use a different email
     </button>
   </div>
+  <div class="text-center mt-2">
+    <a href="/cloud/login?return_to={{ ('/cloud/device?user_code=' ~ user_code) if user_code else '/cloud/device' }}"
+       class="small">
+      Use password instead
+    </a>
+  </div>
 </div>

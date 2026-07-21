@@ -638,15 +638,28 @@ async def email_init(
         acquisition_attribution=attribution_from_request(request),
     )
     # ct-1512 Shard C-fix2 C-2: commit BEFORE spawning the async send so
-    # the spawned task's fresh session can read the just-issued token.
+    # the spawned task's fresh session can read the just-issued token. The
+    # commit also persists the cross-purpose signup supersession even on the
+    # suppressed (None) path below.
     await db.commit()
+    if pending is None:
+        # ct-2983 review-fix (FIX A): a concurrent signup won the shared
+        # ``uq_auth_tokens_active_signup_email`` index. Suppress generically —
+        # no token, no send — and return the SAME sent response with a
+        # throwaway token_id so the device-signup path stays enumeration-safe.
+        response_data: dict[str, object] = {
+            **response_payload,
+            "token_id": str(uuid.uuid4()),
+        }
+        return _build_email_init_response(request, response_data)
+    # ct-1512 Shard C-fix2 C-2: commit already ran above; spawn the async send.
     await spawn_device_flow_email_send(
         token_id=pending.token.id,
         raw_token=pending.raw_token,
         sender=pending.sender,
         workflow=pending.workflow,
     )
-    response_data: dict[str, object] = {
+    response_data = {
         **response_payload,
         "token_id": str(pending.token.id),
     }
@@ -688,7 +701,7 @@ async def _issue_and_send_device_email(
     account: Account | None,
     device_authorization: DeviceAuthorization,
     acquisition_attribution: AcquisitionAttribution | None = None,
-) -> _PendingDeviceEmailSend:
+) -> _PendingDeviceEmailSend | None:
     """Issue the AuthToken row and prepare the email-send closure.
 
     Returns a ``_PendingDeviceEmailSend`` containing the issued token,
@@ -697,6 +710,11 @@ async def _issue_and_send_device_email(
     caller MUST commit the issuance transaction BEFORE invoking
     ``spawn_device_flow_email_send`` with these fields so the spawned
     task's fresh session can read the just-committed row.
+
+    Returns ``None`` when the device-signup issuance was suppressed because a
+    concurrent signup won the shared ``uq_auth_tokens_active_signup_email``
+    index (ct-2983 review-fix, FIX A): the caller renders the same generic
+    sent state without spawning a send.
 
     The sender closure exists only for the spawned task's lifetime —
     the OTP plaintext is never persisted to the DB.
@@ -726,6 +744,11 @@ async def _issue_and_send_device_email(
         device_authorization=device_authorization,
         extra_metadata=extra_metadata,
     )
+    if issued is None:
+        # ct-2983 review-fix (FIX A): device-signup insert was suppressed by a
+        # concurrent signup winning the shared partial unique index. Propagate
+        # the suppression so the route renders the generic sent state.
+        return None
     device_name = display_device_name(device_authorization.client_name)
     expires_minutes = max(1, settings.auth_device_token_expiry_seconds // 60)
     magic_link = _email_link_url(issued.raw_token)

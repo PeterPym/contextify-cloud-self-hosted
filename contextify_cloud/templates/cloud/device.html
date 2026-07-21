@@ -1,8 +1,9 @@
 {% extends "base.html" %}
 {% set hide_sidebar = true %}
+{% set minimal_chrome = true %}
 {% set active_page = 'sync' %}
 
-{% block title %}Connect Contextify on your Mac - Contextify Cloud{% endblock %}
+{% block title %}Connect this Mac - Contextify Cloud{% endblock %}
 
 {# ─────────────────────────────────────────────────────────────────────────
    ct-1512 / ct-1565 — /cloud/device redesign
@@ -10,9 +11,9 @@
    This template renders five visual states per spec §6:
 
      State A   — no session, ?user_code=XXXX in URL: setup-code pill +
-                 email input + "Send sign-in link" button.
+                 email input + connect-link button.
      State A'  — no session, no ?user_code: manual setup-code input
-                 + email input + "Send sign-in link" button.
+                 + email input + connect-link button.
      State B   — email submitted; "Check your email" + spinner + OTP
                  fallback (secondary disclosure under the magic-link CTA).
      State C   — signed in with recent reauth: existing user_code entry
@@ -268,11 +269,17 @@
 
       {# ── State A / A': no session paths ───────────────────────────────── #}
       {% else %}
-      <div class="text-center mb-4">
+      <div class="text-center ctxf-auth-head">
         <i class="bi bi-laptop ctxf-auth-icon" aria-hidden="true"></i>
-        <h2 class="ctxf-auth-title">Connect Contextify on your Mac</h2>
-        <p class="text-secondary mb-0">
-          Sync your AI coding history and search it from any Mac.
+        <h1 class="ctxf-auth-title">Connect this Mac</h1>
+        <p class="ctxf-auth-subtitle mb-0">
+          {% if user_code %}
+          Use this setup code and enter your email address. We'll email you a
+          link to finish connecting.
+          {% else %}
+          Enter both the setup code and your email address. We'll email you a
+          link to finish connecting.
+          {% endif %}
         </p>
       </div>
 
@@ -293,7 +300,7 @@
          modal). #}
       <div class="ctxf-device-pill mb-3 p-3 rounded border text-center"
            role="group" aria-label="Setup code">
-        <div class="small text-secondary mb-1">Setup code</div>
+        <div class="small text-secondary mb-1">1. Setup code</div>
         <div class="d-flex align-items-center justify-content-center gap-2">
           <code class="ctxf-device-pill-code font-monospace fs-4"
                 id="ctxf-device-setup-code"
@@ -306,15 +313,6 @@
           </button>
         </div>
       </div>
-      <p class="text-secondary small mb-3">
-        Enter your email and we'll send a secure sign-in link to finish
-        setup.
-      </p>
-      {% else %}
-      {# State A': manual setup-code input. #}
-      <p class="text-secondary small mb-3">
-        Enter the setup code shown in the Contextify app.
-      </p>
       {% endif %}
 
       {# ct-1512 audit P1-3: explicit method=post + action so a JS bind
@@ -329,7 +327,7 @@
         {% else %}
         <div class="mb-3">
           <label for="ctxf-device-setup-code-input" class="form-label">
-            Setup code
+            1. Setup code
           </label>
           <input type="text"
                  class="form-control font-monospace text-center"
@@ -342,12 +340,12 @@
                  autocapitalize="characters"
                  style="letter-spacing: 0.15em;">
           <div class="form-text">
-            Look for the 8-character code in the Contextify app on your Mac.
+            Find this 8-character code in Contextify on this Mac.
           </div>
         </div>
         {% endif %}
         <div class="mb-3">
-          <label for="ctxf-device-email" class="form-label">Email address</label>
+          <label for="ctxf-device-email" class="form-label">2. Email address</label>
           <input type="email" class="form-control" id="ctxf-device-email"
                  name="email" placeholder="you@example.com" required
                  autocomplete="email"
@@ -355,11 +353,8 @@
         </div>
         <button type="submit" class="btn ctxf-btn-primary w-100 mb-2"
                 id="ctxf-device-submit">
-          Send sign-in link
+          Email me a link to connect
         </button>
-        <div class="form-text text-secondary text-center mb-2">
-          No password needed.
-        </div>
         <div class="invalid-feedback d-block small text-danger d-none"
              id="ctxf-device-init-error" aria-live="polite"></div>
       </form>
@@ -367,11 +362,6 @@
       {# ── State B (await/OTP): shared with State D; toggled by JS ─────── #}
       {% include "cloud/_device_await.html" %}
 
-      <div class="text-center mt-3">
-        <a href="/cloud/login?return_to={{ ('/cloud/device?user_code=' ~ user_code) if user_code else '/cloud/device' }}">
-          Already have a password? Sign in
-        </a>
-      </div>
       {% endif %}
     </div>
   </div>

@@ -17,6 +17,11 @@
   --slate-200: #e2e8f0;
   --slate-800: #1e293b;
   --slate-900: #0f172a;
+  --ctxf-auth-card-radius: 18px;
+  --ctxf-auth-card-shadow: 0 18px 48px -22px rgba(30, 41, 59, 0.26),
+    0 2px 6px rgba(30, 41, 59, 0.04);
+  --ctxf-auth-badge-bg: linear-gradient(150deg, #eaf2fb 0%, #dceaf7 100%);
+  --ctxf-auth-primary-ink: #ffffff;
 }
 
 [data-bs-theme="dark"] {
@@ -28,6 +33,14 @@
   --bg-page: #0f172a;
   --bg-surface: #1e293b;
   --bg-muted: #334155;
+  --ctxf-auth-card-shadow: 0 24px 60px -26px rgba(0, 0, 0, 0.72),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --ctxf-auth-badge-bg: linear-gradient(
+    150deg,
+    rgba(106, 155, 199, 0.2) 0%,
+    rgba(106, 155, 199, 0.07) 100%
+  );
+  --ctxf-auth-primary-ink: #06121f;
 }
 
 /* ── Global ──────────────────────────────────────────────── */
@@ -300,56 +313,189 @@ a:hover {
   display: flex;
   justify-content: center;
   align-items: flex-start;
-  padding: 3rem 1rem;
+  padding: 3.5rem 1rem 4rem;
   min-height: calc(100vh - 200px);
+  background:
+    radial-gradient(
+      900px 460px at 50% -12%,
+      color-mix(in srgb, var(--contextify-primary) 14%, transparent),
+      transparent 62%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--contextify-primary-light) 28%, var(--bg-page)),
+      var(--bg-page) 55%
+    );
 }
 
 .ctxf-auth-card {
   width: 100%;
-  max-width: 440px;
+  max-width: 416px;
   background-color: var(--bg-surface);
-  border: 1px solid var(--slate-200);
-  border-radius: 10px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  border: 1px solid color-mix(in srgb, var(--contextify-primary) 16%, transparent);
+  border-radius: var(--ctxf-auth-card-radius);
+  box-shadow: var(--ctxf-auth-card-shadow);
+  overflow: hidden;
+  position: relative;
 }
 
-[data-bs-theme="dark"] .ctxf-auth-card {
-  border-color: var(--bg-muted);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+.ctxf-auth-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--contextify-primary),
+    transparent
+  );
+  opacity: 0.6;
 }
 
 .ctxf-auth-card .card-body {
-  padding: 2rem;
+  padding: 2.6rem 2.2rem 2.1rem;
 }
 
 .ctxf-auth-icon {
-  font-size: 2.5rem;
+  align-items: center;
+  background: var(--ctxf-auth-badge-bg);
+  border: 1px solid color-mix(in srgb, var(--contextify-primary) 16%, transparent);
+  border-radius: 15px;
   color: var(--contextify-primary);
-  margin-bottom: 0.5rem;
-  display: block;
+  display: flex;
+  font-size: 1.55rem;
+  height: 52px;
+  justify-content: center;
+  margin: 0 auto 1.2rem;
+  width: 52px;
+}
+
+.ctxf-auth-icon.text-warning {
+  background: linear-gradient(
+    150deg,
+    rgba(224, 165, 58, 0.16),
+    rgba(224, 165, 58, 0.06)
+  );
+  border-color: rgba(224, 165, 58, 0.28);
+}
+
+.ctxf-auth-head {
+  margin-bottom: 1.75rem;
+  text-align: center;
 }
 
 .ctxf-auth-title {
-  font-size: 1.5rem;
-  font-weight: 700;
   color: var(--text-primary);
-  margin-bottom: 0.25rem;
+  font-size: 1.55rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin: 0 0 0.45rem;
+  text-wrap: balance;
+}
+
+.ctxf-auth-subtitle {
+  color: var(--text-secondary);
+  font-size: 0.96rem;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.ctxf-auth-subtitle strong,
+.ctxf-auth-lead strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ctxf-auth-field {
+  margin-bottom: 0.9rem;
+}
+
+.ctxf-auth-card .form-label {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin: 0 0 0.4rem 0.1rem;
+}
+
+.ctxf-auth-card .form-control {
+  background: color-mix(in srgb, var(--bg-surface) 72%, var(--bg-page));
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 30%, transparent);
+  border-radius: 11px;
+  color: var(--text-primary);
+  font-size: 0.98rem;
+  padding: 0.78rem 0.9rem;
+}
+
+.ctxf-auth-card .form-control::placeholder {
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+}
+
+.ctxf-auth-card .form-control:focus {
+  background: color-mix(in srgb, var(--bg-surface) 72%, var(--bg-page));
+  border-color: var(--contextify-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--contextify-primary) 22%, transparent);
+  color: var(--text-primary);
 }
 
 .ctxf-btn-primary {
-  background-color: var(--contextify-primary);
-  border-color: var(--contextify-primary);
-  color: #ffffff;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--contextify-primary) 92%, #ffffff 8%),
+    var(--contextify-primary-hover)
+  );
+  border: 0;
+  border-radius: 12px;
+  box-shadow:
+    0 8px 20px -8px color-mix(in srgb, var(--contextify-primary) 65%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  color: var(--ctxf-auth-primary-ink);
   font-weight: 600;
-  padding: 0.6rem 1rem;
-  border-radius: 6px;
-  transition: background-color 0.15s, border-color 0.15s;
+  padding: 0.85rem 1rem;
+  transition: transform 0.12s ease, box-shadow 0.15s ease;
+}
+
+/* ct-2983 (Fable L3): retheme the info alert inside the auth card to the brand
+   light tone so it stops clashing with the primary action's blue. */
+.ctxf-auth-card .alert-info {
+  background-color: var(--contextify-primary-light);
+  border-color: transparent;
+  color: var(--text-primary);
 }
 
 .ctxf-btn-primary:hover {
-  background-color: var(--contextify-primary-hover);
-  border-color: var(--contextify-primary-hover);
-  color: #ffffff;
+  box-shadow:
+    0 12px 26px -8px color-mix(in srgb, var(--contextify-primary) 72%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  color: var(--ctxf-auth-primary-ink);
+  transform: translateY(-1px);
+}
+
+.ctxf-btn-primary:disabled,
+.ctxf-btn-primary.disabled {
+  box-shadow: none;
+  transform: none;
+}
+
+.ctxf-btn-ghost {
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 30%, transparent);
+  border-radius: 12px;
+  color: var(--contextify-primary);
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.78rem 1rem;
+  text-align: center;
+  text-decoration: none;
+  width: 100%;
+}
+
+.ctxf-btn-ghost:hover {
+  background: color-mix(in srgb, var(--contextify-primary) 8%, transparent);
+  color: var(--contextify-primary-hover);
+  text-decoration: none;
 }
 
 .ctxf-auth-fineprint {
@@ -357,73 +503,115 @@ a:hover {
   color: var(--text-secondary);
 }
 
-.ctxf-auth-steps {
-  margin-top: 1.5rem;
-  padding-top: 1.25rem;
-  border-top: 1px solid var(--slate-200);
+.ctxf-auth-lead {
+  color: var(--text-secondary);
+  font-size: 0.98rem;
+  line-height: 1.55;
+  margin: 0 0 1.5rem;
+  text-align: center;
+}
+
+.ctxf-auth-links {
+  align-items: center;
   display: flex;
   flex-direction: column;
-  gap: 0.625rem;
+  gap: 0.85rem;
 }
 
-.ctxf-auth-steps-label {
-  margin: 0 0 0.25rem;
-  font-size: 0.72rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+.ctxf-auth-links a,
+.ctxf-auth-links button,
+.ctxf-auth-alt-action a,
+.ctxf-auth-alt-action button {
+  background: none;
+  border: 0;
   color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.94rem;
+  padding: 0;
+  text-decoration: none;
 }
 
-[data-bs-theme="dark"] .ctxf-auth-steps {
-  border-top-color: var(--bg-muted);
+.ctxf-auth-links a:hover,
+.ctxf-auth-links button:hover,
+.ctxf-auth-alt-action a:hover,
+.ctxf-auth-alt-action button:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
 }
 
-.ctxf-auth-step {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
+.ctxf-auth-links button:disabled {
+  color: var(--text-secondary);
+  cursor: wait;
+  opacity: 0.55;
+  text-decoration: none;
+}
+
+.ctxf-auth-links .ctxf-auth-link-strong {
+  color: var(--contextify-primary);
+  font-weight: 600;
+}
+
+.ctxf-auth-alt-action {
   color: var(--text-secondary);
   font-size: 0.9rem;
+  margin: 1rem 0 0;
+  text-align: center;
 }
 
-.ctxf-auth-step-num {
-  flex: 0 0 auto;
-  width: 1.5rem;
-  height: 1.5rem;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.8rem;
-  font-weight: 600;
-  background-color: var(--contextify-primary);
-  color: #ffffff;
-}
-
-.ctxf-auth-step-num-next {
-  background-color: var(--slate-200);
-  color: var(--text-secondary);
-}
-
-[data-bs-theme="dark"] .ctxf-auth-step-num-next {
-  background-color: var(--bg-muted);
+.ctxf-auth-alt-action .ctxf-auth-dot {
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+  margin: 0 0.4rem;
 }
 
 .ctxf-auth-legal {
-  margin-top: 0.5rem;
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
   font-size: 0.78rem;
-  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 1rem 0 0;
+  text-align: center;
 }
 
 .ctxf-auth-signin {
-  margin-top: 1.5rem;
+  color: var(--text-secondary);
+  font-size: 0.92rem;
+  margin-top: 1.6rem;
+  text-align: center;
 }
 
-.ctxf-auth-trust {
-  margin-top: 1rem;
-  font-size: 0.8rem;
-  color: var(--text-secondary);
+.ctxf-otp-code.form-control {
+  display: block;
+  font-size: 1.25rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.4em;
+  margin: 0 auto 0.55rem;
+  max-width: 232px;
+  padding: 0.78rem 0.5rem;
+  text-align: center;
+  text-indent: 0.4em;
+}
+
+.ctxf-auth-resend-status {
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+  font-size: 0.78rem;
+  margin: 0.75rem 0 0;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ctxf-btn-primary {
+    transition: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .ctxf-auth-container {
+    padding: 2rem 1rem 3rem;
+  }
+
+  .ctxf-auth-card .card-body {
+    padding: 2.1rem 1.6rem;
+  }
 }
 
 /* ── Activity feed ───────────────────────────────────────── */

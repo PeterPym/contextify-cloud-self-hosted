@@ -73,6 +73,14 @@ def _get_endpoint_limits() -> dict[tuple[str, str], int]:
         ("POST", "/api/v1/auth/login/verify-otp"): (
             settings.rate_limit_unauth_login_verify_otp_per_minute
         ),
+        # ct-2983 — email-first passwordless sign-up flow. The register POST
+        # itself is capped by ("POST", "/cloud/register") above (5/min).
+        ("POST", "/cloud/register/email-link/confirm"): (
+            settings.rate_limit_unauth_register_email_link_confirm_per_minute
+        ),
+        ("POST", "/api/v1/auth/register/verify-otp"): (
+            settings.rate_limit_unauth_register_verify_otp_per_minute
+        ),
         # Parameterized: /api/v1/invitations/{token}/accept
         ("POST", "/api/v1/invitations/*/accept"): (
             settings.rate_limit_unauth_invitation_accept_per_minute

@@ -355,12 +355,13 @@ class AuthToken(Base):
             "purpose IN ("
             "'email_verify', 'password_reset', 'email_change', "
             "'device_login_existing_user', 'device_signup_new_user', "
-            "'login_magic_link'"
+            "'login_magic_link', 'browser_signup_new_user'"
             ")",
             name="ck_auth_token_purpose",
         ),
         CheckConstraint(
-            "(purpose <> 'device_signup_new_user' OR account_id IS NULL)"
+            "(purpose NOT IN ('device_signup_new_user', 'browser_signup_new_user')"
+            " OR account_id IS NULL)"
             " AND "
             "(purpose NOT IN ('device_login_existing_user', 'login_magic_link')"
             " OR account_id IS NOT NULL)",
@@ -390,7 +391,10 @@ class AuthToken(Base):
             "uq_auth_tokens_active_signup_email",
             text("lower(btrim(metadata_json->>'signup_email'))"),
             unique=True,
-            postgresql_where=text("purpose = 'device_signup_new_user' AND consumed_at IS NULL"),
+            postgresql_where=text(
+                "purpose IN ('device_signup_new_user', 'browser_signup_new_user')"
+                " AND consumed_at IS NULL"
+            ),
         ),
         Index(
             "idx_auth_tokens_delivery_retry",

@@ -104,6 +104,23 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
+# ct-2983 (security P1): fixed dummy bcrypt hash used to perform equivalent
+# verify work on rejection branches that have no real hash to check (unknown
+# email, multi-membership, NULL password_hash). Hardcoded so the request path
+# never pays gensalt/hashpw cost; mirrors the ct-1512 Shard C sentinel pattern.
+_DUMMY_PASSWORD_HASH = "$2b$12$g4Kd1.6.089gpjsbQNow9.BqlVmDxn/etMcXcxorgAHq7gY4QXToy"
+
+
+async def _reject_after_dummy_verify(password: str) -> None:
+    """Burn one bcrypt verify against the dummy hash before a rejection.
+
+    Keeps no-account and no-password-hash rejections the same cost as a
+    wrong-password rejection, so response timing does not leak which case
+    occurred.
+    """
+    await asyncio.to_thread(verify_password, password, _DUMMY_PASSWORD_HASH)
+
+
 def _hash_token(raw_token: str) -> str:
     payload = f"{settings.api_secret_key}:{raw_token}".encode()
     return hashlib.sha256(payload).hexdigest()
@@ -931,11 +948,13 @@ async def login_with_password(
     )
     rows = result.all()
     if not rows:
+        await _reject_after_dummy_verify(password)
         return None
     if len(rows) > 1 and not settings.allow_multi_membership_accounts:
         return None
     account, user, tenant = rows[0]
     if not account.password_hash:
+        await _reject_after_dummy_verify(password)
         return None
     valid = await asyncio.to_thread(verify_password, password, account.password_hash)
     if not valid:
@@ -1037,6 +1056,94 @@ async def request_password_reset(db: AsyncSession, *, email: str) -> None:
         account.id,
         is_passwordless,
     )
+
+
+# ct-2983 — shared per-email magic-link send cooldown for the browser
+# magic-link INIT paths (login email-link + register email-first). The device
+# flow is out of scope (§3c) — it has its own per-device atomic send cap — so
+# device purposes are intentionally NOT keyed here.
+#
+# Browser-reachable send purposes for a given email. The browser silent-skip
+# branches (unknown/disabled) issue their sentinel row under
+# ``login_magic_link`` too, so this set keeps the cooldown enumeration-safe:
+# existing, unknown, and disabled emails are all suppressed identically. The
+# query is additionally time + email scoped, so only tokens the browser paths
+# created within the window can ever match.
+_MAGIC_LINK_SEND_PURPOSES: tuple[str, ...] = (
+    "login_magic_link",
+    "browser_signup_new_user",
+)
+
+# Delivery states that count as a recent send attempt. Real tokens start
+# ``pending`` and become ``sent`` / ``failed`` via the async-send task;
+# sentinel tokens are stamped ``exhausted`` at issue time (so the outbox never
+# retries them). ``exhausted`` MUST be included so the unknown/disabled
+# sentinel path is suppressed identically to the real path — otherwise the
+# cooldown itself becomes an enumeration oracle.
+_MAGIC_LINK_SEND_DELIVERY_STATUSES: tuple[str, ...] = (
+    "pending",
+    "sent",
+    "failed",
+    "exhausted",
+)
+
+
+# ct-2983 review-fix: stable salt for the per-email magic-link issuance
+# advisory lock. Distinct from the ``auth-token:`` replacement-lock namespace
+# so unrelated locks never collide.
+_MAGIC_LINK_ISSUE_LOCK_SALT = "contextify-magic-link-issue"
+
+
+async def lock_magic_link_issue_for_email(
+    db: AsyncSession, *, email_normalized: str
+) -> None:
+    """Serialize the per-email magic-link check-and-issue with an advisory lock.
+
+    ct-2983 review-fix (cooldown race): ``magic_link_send_within_cooldown`` is a
+    read-only SELECT and the later issuance+commit is not atomic with it, so two
+    concurrent same-email requests could both pass the cooldown and both issue
+    (duplicate send, or a unique-index 500). Acquiring a transaction-scoped
+    advisory lock at the START of the issuance transaction — BEFORE the cooldown
+    check — serializes concurrent callers: the second blocks until the first
+    commits (releasing the lock), then its cooldown SELECT sees the first's
+    committed token and suppresses. Both callers return the identical generic
+    sent state. The lock releases automatically at transaction end
+    (commit/rollback), which every issuance path reaches. Uses a stable salt so
+    unrelated advisory locks do not collide.
+    """
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))").bindparams(
+            key=f"{_MAGIC_LINK_ISSUE_LOCK_SALT}:{email_normalized}"
+        )
+    )
+
+
+async def magic_link_send_within_cooldown(
+    db: AsyncSession, *, email_normalized: str
+) -> bool:
+    """Return True if a recent send-bearing magic-link token exists for the email.
+
+    ct-2983: the shared, enumeration-safe per-email send cooldown for the
+    browser magic-link INIT paths (login email-link + register email-first).
+    Mirrors the ``request_password_reset`` cooldown query but
+    keys ONLY on ``email_normalized`` (NOT ``account_id``) so existing,
+    unknown-sentinel, and disabled emails behave identically. A configured
+    cooldown of 0 (or less) disables the check.
+    """
+    cooldown_seconds = settings.magic_link_send_cooldown_seconds
+    if cooldown_seconds <= 0:
+        return False
+    cutoff = datetime.now(UTC) - timedelta(seconds=cooldown_seconds)
+    result = await db.execute(
+        select(AuthToken.id).where(
+            AuthToken.email_normalized == email_normalized,
+            AuthToken.purpose.in_(_MAGIC_LINK_SEND_PURPOSES),
+            AuthToken.consumed_at.is_(None),
+            AuthToken.created_at > cutoff,
+            AuthToken.delivery_status.in_(_MAGIC_LINK_SEND_DELIVERY_STATUSES),
+        )
+    )
+    return result.first() is not None
 
 
 async def reset_password(db: AsyncSession, *, raw_token: str, password: str) -> bool:
@@ -1743,6 +1850,13 @@ async def _create_passwordless_account_with_tenant(
     user demonstrated inbox control by clicking the link / entering the
     OTP, which is the verify-then-create rationale from spec §4.
 
+    Name/workspace derivation follows the ct-2714 rules used by
+    ``register_with_password``: the display name and tenant name are
+    derived from the email local-part via ``_display_name_from_email``,
+    and the tenant slug is probed deterministically via
+    ``_generate_unique_tenant_slug`` (no random suffix unless the
+    probed slug collides).
+
     Caller wraps this in a transaction; on partial-unique-index race the
     ``IntegrityError`` is caught one level up (in
     ``_finalize_device_token``) and the existing-account branch runs
@@ -1750,7 +1864,9 @@ async def _create_passwordless_account_with_tenant(
     """
     now = datetime.now(UTC)
     local_part = email_normalized.split("@", 1)[0] or "team"
-    slug_seed = f"{local_part}-{secrets.token_hex(3)}"
+    resolved_name = _display_name_from_email(local_part)
+    resolved_team_name = f"{resolved_name}'s Workspace"
+    slug = await _generate_unique_tenant_slug(db, local_part)
     account = Account(
         email_normalized=email_normalized,
         email_display=email_display,
@@ -1769,10 +1885,10 @@ async def _create_passwordless_account_with_tenant(
 
     tenant, user, _ = await provision_tenant(
         db=db,
-        name=local_part,
-        slug=slug_seed,
+        name=resolved_team_name,
+        slug=slug,
         email=email_display,
-        user_name=local_part,
+        user_name=resolved_name,
         create_default_api_key=False,
     )
     apply_attribution_to_tenant(tenant, acquisition_attribution)
@@ -2319,4 +2435,177 @@ async def _finalize_login_token(
         session_token=session_token,
         device_authorization_id=None,
         was_new_signup=False,
+    )
+
+
+async def _finalize_browser_signup_token(
+    db: AsyncSession,
+    *,
+    raw_token: str,
+    db_session_user: User | None = None,
+    request_ip: str | None = None,
+    user_agent: str | None = None,
+    method: str = "link",
+) -> FinalizeResult:
+    """Consume a verified ``browser_signup_new_user`` token (no device flow).
+
+    ct-2983 (Option B+ / Decision-2a): the browser analogue of
+    ``_finalize_device_token``'s ``device_signup_new_user`` branch for the
+    email-first passwordless sign-up flow. Same atomicity and self-healing
+    semantics as ``_finalize_login_token``, but it materializes (or recovers)
+    a passwordless Account+Tenant+User via ``_resolve_signup_account`` and
+    never touches a device_authorization row. Returns
+    ``device_authorization_id=None``.
+
+    Registration is RE-CHECKED at verify time (ct-2994): if
+    ``settings.enable_registration`` was flipped off after the token was
+    issued, finalize refuses to create the account. The token is consumed
+    either way so it cannot be replayed once registration is re-enabled.
+
+    ``was_new_signup`` gates the welcome email, operator notification, and
+    the ``signup`` funnel event, exactly as the device signup branch does.
+    """
+    token = await consume_auth_token(
+        db,
+        raw_token=raw_token,
+        purpose="browser_signup_new_user",
+    )
+    if token is None:
+        _emit_device_flow_error(
+            error_code="token_unknown",
+            purpose="browser_signup_new_user",
+            endpoint="finalize_browser_signup_token",
+            method=method,
+        )
+        raise BrowserAuthError(
+            "This sign-up link has expired or already been used. "
+            "Request a new one from the sign-up page."
+        )
+
+    # Refuse to finalize sentinel tokens even on a structurally-impossible OTP
+    # match (mirrors _finalize_login_token). Browser-signup sentinels are not
+    # issued today, but the guard is kept identical for defense-in-depth.
+    metadata = token.metadata_json or {}
+    if metadata.get("is_sentinel") is True:
+        await _commit_consumed_token_failure(db)
+        _emit_device_flow_error(
+            error_code="token_unknown",
+            purpose=token.purpose,
+            token_id=token.id,
+            endpoint="finalize_browser_signup_token",
+            method=method,
+        )
+        raise BrowserAuthError(
+            "This sign-up link has expired or already been used. "
+            "Request a new one from the sign-up page."
+        )
+
+    # ct-2994: re-check registration at verify time. The token is already
+    # consumed, so a later re-enable cannot resurrect this link.
+    if not settings.enable_registration:
+        await _commit_consumed_token_failure(db)
+        _emit_device_flow_error(
+            error_code="registration_disabled",
+            purpose=token.purpose,
+            token_id=token.id,
+            endpoint="finalize_browser_signup_token",
+            method=method,
+        )
+        raise BrowserAuthError("Account sign-up is not available.")
+
+    token_purpose_snapshot = token.purpose
+    token_id_snapshot = token.id
+    try:
+        acquisition_attribution = attribution_from_metadata(metadata)
+        account, user_obj, tenant, was_new_signup = await _resolve_signup_account(
+            db,
+            token=token,
+            metadata=metadata,
+            request_ip=request_ip,
+            user_agent=user_agent,
+            acquisition_attribution=acquisition_attribution,
+        )
+    except BrowserAuthError as exc:
+        # ct-2983 review-fix: burn the token before surfacing the rejection.
+        # ``consume_auth_token`` does not commit internally, and the reject
+        # branches inside ``_resolve_signup_account`` that DO persist the
+        # consume are not exhaustive — ``_resolve_owner_user_for_account``
+        # (orphaned membership) raises without committing. Without this
+        # commit the caller (or ``get_db``'s later commit) is not guaranteed
+        # to persist the consume, so the same link stays replayable after a
+        # resolution rejection. Any partial account rows raised through here
+        # were created inside the ``_resolve_signup_account`` SAVEPOINT and
+        # have already rolled back, so only the consumed_at UPDATE persists.
+        await _commit_consumed_token_failure(db)
+        _emit_device_flow_error(
+            error_code="account_resolve_rejected",
+            purpose=token_purpose_snapshot,
+            token_id=token_id_snapshot,
+            endpoint="finalize_browser_signup_token",
+            method=method,
+        )
+        raise exc
+
+    await _self_heal_account(account)
+
+    session, session_token = await _resolve_or_reuse_session(
+        db,
+        account=account,
+        user=user_obj,
+        tenant=tenant,
+        db_session_user=db_session_user,
+        request_ip=request_ip,
+        user_agent=user_agent,
+    )
+
+    # Snapshot welcome-email arguments BEFORE commit so the post-commit send is
+    # independent of any ORM-attribute expiration (mirrors _finalize_device_token).
+    welcome_email_to = account.email_display if was_new_signup else None
+    welcome_name = user_obj.name if was_new_signup else None
+    welcome_email_norm = account.email_normalized if was_new_signup else None
+    welcome_user_agent = user_agent if was_new_signup else None
+
+    account.last_login_at = datetime.now(UTC)
+    await db.commit()
+
+    _emit_device_flow_finalized(
+        method=method,
+        account=account,
+        device_authorization_id=None,
+        was_new_signup=was_new_signup,
+        time_to_completion_seconds=_time_to_completion_seconds(token),
+        token_id=token.id,
+        purpose=token.purpose,
+    )
+
+    is_internal = tenant_is_internal(tenant)
+    if welcome_email_to is not None:
+        await spawn_welcome_email_after_device_signup(
+            to_email=welcome_email_to,
+            name=welcome_name,
+            email_normalized=welcome_email_norm or "",
+            user_agent=welcome_user_agent,
+        )
+        await notify_new_signup(
+            email=welcome_email_to,
+            tenant_id=str(tenant.id),
+            plan=tenant.plan,
+            user_agent=welcome_user_agent,
+            is_internal=is_internal,
+        )
+        await emit_funnel_event(
+            "signup",
+            distinct_id=str(tenant.id),
+            properties=with_tenant_acquisition_properties(tenant, {"plan": tenant.plan}),
+            is_internal=is_internal,
+        )
+
+    return FinalizeResult(
+        account=account,
+        user=user_obj,
+        tenant=tenant,
+        session=session,
+        session_token=session_token,
+        device_authorization_id=None,
+        was_new_signup=was_new_signup,
     )

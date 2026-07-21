@@ -39,6 +39,7 @@ from contextify_cloud.services.browser_auth import (
     _emit_device_flow_email_init,
     _raw_token_for_auth_token,
     create_auth_token_record,
+    lock_magic_link_issue_for_email,
 )
 from contextify_cloud.services.device_auth_codes import hash_user_code
 from contextify_cloud.utils.email import normalize_email
@@ -49,6 +50,18 @@ logger = logging.getLogger(__name__)
 _DEVICE_LOGIN_PURPOSE = "device_login_existing_user"
 _DEVICE_SIGNUP_PURPOSE = "device_signup_new_user"
 _LOGIN_MAGIC_LINK_PURPOSE = "login_magic_link"
+_BROWSER_SIGNUP_PURPOSE = "browser_signup_new_user"
+# ct-2983 review-fix: the two signup purposes that share the
+# ``uq_auth_tokens_active_signup_email`` partial unique index. A new signup
+# token for an email must supersede any active token in EITHER purpose so the
+# device-flow and browser-flow signups cannot collide on the shared index.
+_ACTIVE_SIGNUP_PURPOSES = (_DEVICE_SIGNUP_PURPOSE, _BROWSER_SIGNUP_PURPOSE)
+# ct-2983 review-fix: the partial unique index whose collision the signup
+# SAVEPOINT is allowed to suppress. Any other IntegrityError (CHECK, NOT-NULL,
+# an unrelated unique index) must propagate rather than be masked as a generic
+# "sent" state with no email actually sent.
+_ACTIVE_SIGNUP_UNIQUE_CONSTRAINT = "uq_auth_tokens_active_signup_email"
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
 _OTP_LENGTH = 6
 
 # ── Sentinel-token enumeration defense (ct-1512 Shard C-fix2 C-1) ───────
@@ -472,7 +485,7 @@ async def issue_device_email_token(
     purpose: str,
     device_authorization: DeviceAuthorization,
     extra_metadata: dict[str, object] | None = None,
-) -> IssuedDeviceToken:
+) -> IssuedDeviceToken | None:
     """Create a new device-flow magic-link / OTP AuthToken row.
 
     Stamps the OTP hash and ``device_authorization_id`` on
@@ -483,13 +496,28 @@ async def issue_device_email_token(
     callers that forget to normalize must not be able to bypass the
     index by passing a mixed-case address.
 
-    Resend semantics (ct-1512 finding B4): prior-token invalidation is
-    scoped to ``(purpose, device_authorization_id)`` rather than
-    ``(purpose, email_normalized)`` / ``(purpose, account_id)`` so a
-    re-send for one device flow cannot clobber an active flow for the
-    same email/account on a *different* device. The wider scope is
-    skipped via ``skip_prior_invalidation=True`` and the targeted UPDATE
-    runs in this helper.
+    Resend semantics for LOGIN (ct-1512 finding B4): prior-token invalidation
+    is scoped to ``(purpose, device_authorization_id)`` rather than
+    ``(purpose, email_normalized)`` / ``(purpose, account_id)`` so a re-send
+    for one device flow cannot clobber an active flow for the same
+    email/account on a *different* device. The wider scope is skipped via
+    ``skip_prior_invalidation=True`` and the targeted UPDATE runs in this
+    helper.
+
+    ct-2983 review-fix (FIX A, symmetric cross-flow supersession): the SIGNUP
+    branch (``device_signup_new_user``) instead routes through the shared
+    ``_issue_signup_token_serialized`` contract so it honors the
+    ``uq_auth_tokens_active_signup_email`` partial unique index that also
+    covers ``browser_signup_new_user``. A lingering browser-signup token for
+    the same email is superseded before the device insert (and vice-versa),
+    so the two flows cannot collide on the shared index in either ordering.
+    Because the shared index already forces at most one active signup token
+    per email, the per-device-scoped invalidation is unnecessary for signup —
+    the email-scoped supersession is a strict superset. Returns ``None`` when a
+    concurrent signup won the shared index (the caller renders the same generic
+    sent state, no 500, no enumeration signal). The device flow keeps its
+    exemption from the browser SEND cooldown — only the shared-index
+    supersession + serialization lock is shared.
     """
     if purpose not in (_DEVICE_LOGIN_PURPOSE, _DEVICE_SIGNUP_PURPOSE):
         raise ValueError(f"unsupported device-flow purpose: {purpose!r}")
@@ -503,36 +531,50 @@ async def issue_device_email_token(
     if extra_metadata:
         metadata.update(extra_metadata)
 
-    # Defense-in-depth: re-normalize signup_email so the partial unique
-    # index covers the canonical form even when the caller forgets.
     if purpose == _DEVICE_SIGNUP_PURPOSE:
+        # Defense-in-depth: re-normalize signup_email so the partial unique
+        # index covers the canonical form even when the caller forgets.
         raw_signup = metadata.get("signup_email")
         if isinstance(raw_signup, str) and raw_signup:
             metadata["signup_email"] = normalize_email(raw_signup)
+        signup_email_key = str(metadata.get("signup_email") or "")
 
-    # Per-device invalidation: replace any prior unconsumed token for
-    # *this same device_authorization_id* (ct-1512 finding B4).
-    now = datetime.now(UTC)
-    await db.execute(
-        update(AuthToken)
-        .where(
-            AuthToken.purpose == purpose,
-            AuthToken.consumed_at.is_(None),
-            AuthToken.metadata_json["device_authorization_id"].astext
-            == str(device_authorization.id),
+        # Shared serialized issuance contract (advisory lock + cross-purpose
+        # supersession + SAVEPOINT insert with narrowed integrity handling).
+        issued = await _issue_signup_token_serialized(
+            db,
+            email_normalized=signup_email_key,
+            email_display=email_display,
+            purpose=_DEVICE_SIGNUP_PURPOSE,
+            metadata=metadata,
         )
-        .values(consumed_at=now)
-    )
+        if issued is None:
+            return None
+        token, raw_token = issued
+    else:
+        # LOGIN branch: per-device invalidation — replace any prior unconsumed
+        # token for *this same device_authorization_id* (ct-1512 finding B4).
+        now = datetime.now(UTC)
+        await db.execute(
+            update(AuthToken)
+            .where(
+                AuthToken.purpose == purpose,
+                AuthToken.consumed_at.is_(None),
+                AuthToken.metadata_json["device_authorization_id"].astext
+                == str(device_authorization.id),
+            )
+            .values(consumed_at=now)
+        )
 
-    token, raw_token = await create_auth_token_record(
-        db,
-        account=account,
-        email=email_display,
-        purpose=purpose,
-        expires_in=timedelta(seconds=settings.auth_device_token_expiry_seconds),
-        metadata=metadata,
-        skip_prior_invalidation=True,
-    )
+        token, raw_token = await create_auth_token_record(
+            db,
+            account=account,
+            email=email_display,
+            purpose=purpose,
+            expires_in=timedelta(seconds=settings.auth_device_token_expiry_seconds),
+            metadata=metadata,
+            skip_prior_invalidation=True,
+        )
 
     # Funnel-stage emission (ct-1512 finding B7): the service layer owns
     # the ``device_flow_email_init`` event so route handlers do not
@@ -739,6 +781,228 @@ async def issue_login_email_token(
         client_ip=None,
         token_id=token.id,
         endpoint="login-email-init",
+    )
+
+    return IssuedDeviceToken(token=token, raw_token=raw_token, otp=otp)
+
+
+async def _supersede_active_signup_tokens(
+    db: AsyncSession, *, email_normalized: str
+) -> None:
+    """Consume any unconsumed signup token for this email across BOTH purposes.
+
+    ct-2983 review-fix (cross-flow collision): ``create_auth_token_record``
+    only supersedes the same ``(purpose, email)`` pair, but the
+    ``uq_auth_tokens_active_signup_email`` partial unique index covers
+    ``device_signup_new_user`` AND ``browser_signup_new_user`` on the shared
+    ``lower(btrim(metadata_json->>'signup_email'))`` key. A lingering
+    unconsumed ``device_signup_new_user`` token would otherwise collide with a
+    fresh ``browser_signup_new_user`` insert (IntegrityError -> 500 and an
+    enumeration oracle). The predicate matches the index's key expression
+    exactly so every colliding row is superseded.
+    """
+    signup_email_key = func.lower(func.btrim(AuthToken.metadata_json["signup_email"].astext))
+    await db.execute(
+        update(AuthToken)
+        .where(
+            AuthToken.purpose.in_(_ACTIVE_SIGNUP_PURPOSES),
+            AuthToken.consumed_at.is_(None),
+            signup_email_key == email_normalized,
+        )
+        .values(consumed_at=datetime.now(UTC))
+    )
+
+
+def _integrity_constraint_name(orig: object | None) -> str | None:
+    """Best-effort extraction of the violated constraint name.
+
+    asyncpg surfaces ``constraint_name`` directly on the wrapped driver error;
+    psycopg exposes it via ``diag.constraint_name``. Returns ``None`` when the
+    driver does not attach the name so the caller can fall back to matching the
+    constraint literal in the error text.
+    """
+    if orig is None:
+        return None
+    name = getattr(orig, "constraint_name", None)
+    if name:
+        return str(name)
+    diag = getattr(orig, "diag", None)
+    if diag is not None:
+        name = getattr(diag, "constraint_name", None)
+        if name:
+            return str(name)
+    return None
+
+
+def _is_active_signup_unique_violation(exc: IntegrityError) -> bool:
+    """Return ``True`` only for a unique violation on the shared signup index.
+
+    ct-2983 review-fix (FIX B, overbroad IntegrityError suppression): the
+    signup SAVEPOINT must swallow ONLY the expected
+    ``uq_auth_tokens_active_signup_email`` collision (SQLSTATE ``23505`` on that
+    constraint). A CHECK, NOT-NULL, or unrelated-unique violation would
+    otherwise be silently converted into a generic "check your email" sent
+    state with no email sent, hiding a real defect. Those must propagate.
+
+    SQLSTATE is read defensively from both driver shapes (asyncpg
+    ``sqlstate`` / psycopg ``pgcode``). The constraint name is read from the
+    driver diagnostic when available, with a substring match on the error text
+    as the fallback for drivers that do not attach it.
+    """
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate != _UNIQUE_VIOLATION_SQLSTATE:
+        return False
+    constraint = _integrity_constraint_name(orig)
+    if constraint is not None:
+        return constraint == _ACTIVE_SIGNUP_UNIQUE_CONSTRAINT
+    # Fallback: the driver did not surface a constraint name; match the literal.
+    return _ACTIVE_SIGNUP_UNIQUE_CONSTRAINT in str(orig if orig is not None else exc)
+
+
+async def _issue_signup_token_serialized(
+    db: AsyncSession,
+    *,
+    email_normalized: str,
+    email_display: str,
+    purpose: str,
+    metadata: dict[str, object],
+) -> tuple[AuthToken, str] | None:
+    """Serialized, shared-index-safe issuance for a signup-purpose AuthToken.
+
+    ct-2983 review-fix (FIX A, symmetric cross-flow supersession): the single
+    issuance contract honored by BOTH signup paths — ``/cloud/register``
+    (``browser_signup_new_user``) and the device-flow signup branch
+    (``device_signup_new_user``). Both purposes share the
+    ``uq_auth_tokens_active_signup_email`` partial unique index, so a token
+    issued in either purpose must supersede any active token in EITHER purpose
+    for the same email, or the second insert collides on the shared index
+    (IntegrityError -> 500 and a distinguishable-latency enumeration oracle).
+
+    The contract, in order:
+
+      1. Acquire the per-email issuance advisory lock so two concurrent
+         signups (device + browser, or two browsers) for the same email
+         serialize rather than racing the supersession/insert window.
+      2. Supersede every active signup token for the email across BOTH signup
+         purposes (``_supersede_active_signup_tokens``).
+      3. Insert inside a SAVEPOINT; a residual collision on the shared index
+         (a concurrent signup that committed between the supersession and the
+         insert) is caught via the NARROWED ``_is_active_signup_unique_violation``
+         check and treated as generic suppression -> returns ``None``. Every
+         other IntegrityError re-raises (FIX B).
+
+    Returns ``(token, raw_token)`` on success, or ``None`` when the shared index
+    rejected the insert (the caller renders the same generic sent state, no 500,
+    no enumeration signal). The device flow keeps its exemption from the browser
+    SEND cooldown; only this shared-index supersession + serialization lock is
+    shared, not the cooldown check.
+    """
+    if purpose not in _ACTIVE_SIGNUP_PURPOSES:
+        raise ValueError(f"not a signup purpose: {purpose!r}")
+
+    # (1) serialize the per-email check-and-issue.
+    await lock_magic_link_issue_for_email(db, email_normalized=email_normalized)
+    # (2) cross-purpose supersession across both signup purposes.
+    await _supersede_active_signup_tokens(db, email_normalized=email_normalized)
+    # (3) SAVEPOINT-wrapped insert with narrowed integrity handling (FIX B).
+    try:
+        async with db.begin_nested():
+            token, raw_token = await create_auth_token_record(
+                db,
+                account=None,
+                email=email_display,
+                purpose=purpose,
+                expires_in=timedelta(seconds=settings.auth_device_token_expiry_seconds),
+                metadata=metadata,
+            )
+    except IntegrityError as exc:
+        if not _is_active_signup_unique_violation(exc):
+            raise
+        logger.info(
+            "event=signup_token_issue_suppressed_by_race purpose=%s",
+            purpose,
+        )
+        return None
+    return token, raw_token
+
+
+async def issue_register_signup_email_token(
+    db: AsyncSession,
+    *,
+    email_display: str,
+    email_normalized: str,
+    extra_metadata: dict[str, object] | None = None,
+) -> IssuedDeviceToken | None:
+    """Create a new ``browser_signup_new_user`` AuthToken for ``/cloud/register``.
+
+    ct-2983 (Option B+ / Decision-2a): the browser analogue of
+    ``issue_device_email_token`` for the no-device, email-first sign-up flow.
+    There is no ``account_id`` (the account is created passwordless only when
+    the emailed link / OTP is consumed) and no ``device_authorization_id``; the
+    metadata carries the OTP hash + attempt counter plus the ``signup_email``,
+    ``signup_metadata`` and acquisition attribution stamped by the caller.
+
+    Like ``issue_device_email_token`` the helper defensively re-normalizes
+    ``signup_email`` so the ``uq_auth_tokens_active_signup_email`` partial
+    unique index covers the canonical form even when the caller forgets.
+
+    ct-2983 review-fix: before inserting, it supersedes any active token in
+    EITHER signup purpose for this email (``_supersede_active_signup_tokens``)
+    so a lingering ``device_signup_new_user`` token cannot collide with the new
+    ``browser_signup_new_user`` insert on the shared partial unique index. The
+    insert is wrapped in a SAVEPOINT; a residual ``IntegrityError`` (a
+    concurrent signup won the index between the supersession and the insert) is
+    caught and treated as generic suppression -> returns ``None`` so the caller
+    renders the same "check your email" sent state (no 500, no second send, no
+    enumeration signal).
+
+    The email-enumeration defense lives in the caller: only call this for
+    unknown emails when registration is enabled. Existing accounts get a
+    login magic link; disabled accounts silent-skip via a sentinel.
+    """
+    otp = _generate_otp()
+    metadata: dict[str, object] = {
+        "otp_hash": _hash_otp(otp),
+        "otp_failed_attempts": 0,
+        "signup_email": email_normalized,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    # Defense-in-depth: re-normalize signup_email so the partial unique index
+    # covers the canonical form even when the caller passes a mixed-case value.
+    raw_signup = metadata.get("signup_email")
+    if isinstance(raw_signup, str) and raw_signup:
+        metadata["signup_email"] = normalize_email(raw_signup)
+    signup_email_key = str(metadata["signup_email"])
+
+    # ct-2983 review-fix: shared serialized issuance contract (advisory lock +
+    # cross-purpose supersession + SAVEPOINT-guarded insert with narrowed
+    # integrity handling). Identical to the device-flow signup branch so the
+    # two paths cannot collide on the shared partial unique index in either
+    # ordering.
+    issued = await _issue_signup_token_serialized(
+        db,
+        email_normalized=signup_email_key,
+        email_display=email_display,
+        purpose=_BROWSER_SIGNUP_PURPOSE,
+        metadata=metadata,
+    )
+    if issued is None:
+        return None
+    token, raw_token = issued
+
+    # Funnel-stage emission (ct-1512 finding B7): service layer owns
+    # ``device_flow_email_init`` so route handlers do not double-emit.
+    _emit_device_flow_email_init(
+        purpose=_BROWSER_SIGNUP_PURPOSE,
+        account_status="new",
+        device_authorization_id=None,
+        email_normalized=token.email_normalized or email_display,
+        client_ip=None,
+        token_id=token.id,
+        endpoint="register-email-init",
     )
 
     return IssuedDeviceToken(token=token, raw_token=raw_token, otp=otp)

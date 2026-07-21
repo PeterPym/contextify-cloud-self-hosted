@@ -473,6 +473,41 @@ async def send_login_magic_link(
     )
 
 
+async def send_register_signup_email(
+    to_email: str,
+    signup_email: str,
+    magic_link_url: str,
+    otp_code: str,
+    expires_in_minutes: int,
+) -> bool:
+    """Send the email-first passwordless sign-up link for ``/cloud/register``.
+
+    ct-2983 (Option B+ / Decision-2a): the browser analogue of
+    ``send_device_signup_new_user``. No Account row exists yet at the time of
+    send; a passwordless one is created when the user completes the magic link
+    or OTP step (see ``_finalize_browser_signup_token``). The dispatcher gates
+    this so it is only sent for unknown emails when registration is enabled;
+    the email enumeration defense lives in the caller.
+    """
+    context = {
+        "to_email": to_email,
+        "signup_email": signup_email,
+        "magic_link_url": magic_link_url,
+        "otp_code": otp_code,
+        "expires_in_minutes": expires_in_minutes,
+    }
+    text = _render_email_template("email/register_signup_new_user.txt", **context)
+    html = _render_email_template("email/register_signup_new_user.html", **context)
+    return await send_transactional_email(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Finish creating your Contextify account",
+            text=text,
+            html=html,
+        )
+    )
+
+
 def _smtp_configured() -> bool:
     """Check whether SMTP credentials are configured."""
     return bool(settings.smtp_host and settings.smtp_host.strip())
