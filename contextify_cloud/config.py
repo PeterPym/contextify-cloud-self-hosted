@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     license_delivery_max_attempts: int = 5
     license_delivery_retry_delay_seconds: int = 300
     license_delivery_outbox_interval_seconds: int = 60
+    # ct-3303: how long shutdown waits for in-flight funnel sends before giving up.
+    # Defaults to the funnel backend's own HTTP timeout: a shorter bound would
+    # guarantee dropping healthy sends, and a longer one only helps when the
+    # backend is already timing out, which is exactly when a deploy should not
+    # wait. On expiry the undelivered count is logged rather than lost silently.
+    funnel_shutdown_drain_seconds: float = 5.0
     # Anonymous license retrieval (ct-2015): short-lived single-use magic link,
     # plus a per-email cooldown so the request endpoint cannot be used to email-bomb.
     license_retrieval_link_ttl_minutes: int = 30

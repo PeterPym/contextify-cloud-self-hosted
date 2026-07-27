@@ -14,6 +14,8 @@ from contextify_cloud.app_factory import (
     create_app,
 )
 from contextify_cloud.config import settings
+from contextify_cloud.profiles import CloudProfile
+from contextify_cloud.services import funnel_events
 
 logger = logging.getLogger(__name__)
 validate_runtime_settings = app_factory.validate_runtime_settings
@@ -113,13 +115,25 @@ async def _auth_email_outbox_scheduler_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Compatibility lifespan for tests that patch helpers through main."""
-    validate_runtime_settings(getattr(app.state, "cloud_profile", None))
+    profile = getattr(app.state, "cloud_profile", None)
+    validate_runtime_settings(profile)
 
     purge_task = asyncio.create_task(_purge_scheduler_loop())
     auth_email_outbox_task = asyncio.create_task(_auth_email_outbox_scheduler_loop())
     try:
         yield
     finally:
+        # ct-3303: drain in-flight funnel sends BEFORE cancelling the scheduler
+        # tasks, so a drain is never racing a CancelledError unwind. Bounded and
+        # non-raising: a stalled deploy is worse than a dropped event.
+        await funnel_events.drain_pending(settings.funnel_shutdown_drain_seconds)
+        # ct-3302: the same gap in the relay's forward set. Hosted-only, so the
+        # import stays function-local behind the profile check, matching
+        # _include_hosted_routers -- a self-hosted deploy must never import it.
+        if profile is CloudProfile.HOSTED:
+            from contextify_cloud.hosted import telemetry_relay
+
+            await telemetry_relay.drain_pending()
         for task in (purge_task, auth_email_outbox_task):
             task.cancel()
         for task in (purge_task, auth_email_outbox_task):

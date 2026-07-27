@@ -91,6 +91,7 @@ from contextify_cloud.services.email import (
     send_device_signin_existing_user,
     send_device_signup_new_user,
 )
+from contextify_cloud.services.funnel_events import emit_funnel_event_after_commit
 from contextify_cloud.services.tenant_guard import check_tenant_active
 from contextify_cloud.utils.email import (
     display_device_name,
@@ -401,6 +402,18 @@ async def poll_device_token(
     logger.info(
         "Device flow completed: user=%s tenant=%s key_id=%s",
         user.email, tenant.slug, key_id,
+    )
+
+    # ct-3286: the credential is not real until this request's transaction
+    # commits, and this handler does not commit -- get_db does, after it returns.
+    # Registering on after_commit means a rollback emits nothing at all rather
+    # than a phantom activation.
+    emit_funnel_event_after_commit(
+        db,
+        "sync_credential_issued",
+        distinct_id=str(tenant.id),
+        properties={"plan": tenant.plan},
+        is_internal=bool(getattr(tenant, "is_internal", False)),
     )
 
     token_data = DeviceTokenResponse(

@@ -30,6 +30,7 @@ from contextify_cloud.middleware.security_headers import SecurityHeadersMiddlewa
 from contextify_cloud.middleware.unauth_rate_limit import UnauthRateLimitMiddleware
 from contextify_cloud.monitoring import ErrorMonitoringMiddleware, init_error_monitoring
 from contextify_cloud.profiles import CloudProfile, profile_from_settings
+from contextify_cloud.services import funnel_events
 
 configure_logging(settings.log_level, settings.log_format)
 init_error_monitoring()
@@ -299,6 +300,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # ct-3303: drain in-flight funnel sends BEFORE cancelling the scheduler
+        # tasks, so a drain is never racing a CancelledError unwind. Bounded and
+        # non-raising: a stalled deploy is worse than a dropped event.
+        await funnel_events.drain_pending(settings.funnel_shutdown_drain_seconds)
+        # ct-3302: the same gap in the relay's forward set. Hosted-only, so the
+        # import stays function-local behind the profile check, matching
+        # _include_hosted_routers -- a self-hosted deploy must never import it.
+        if profile is CloudProfile.HOSTED:
+            from contextify_cloud.hosted import telemetry_relay
+
+            await telemetry_relay.drain_pending()
         for task in background_tasks:
             task.cancel()
         for task in background_tasks:

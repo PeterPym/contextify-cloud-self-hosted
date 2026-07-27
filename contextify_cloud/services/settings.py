@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from contextify_cloud.middleware.auth import AuthContext, generate_api_key, hash_api_key
 from contextify_cloud.models import ApiKey, Tenant, User
 from contextify_cloud.services.audit import log_event
+from contextify_cloud.services.funnel_events import emit_funnel_event_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,28 @@ async def get_user_api_keys(
     ]
 
 
+async def _queue_sync_credential_issued(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """ct-3286: register the credential-issued emit for THIS transaction's commit.
+
+    Registered before the commit and fired by it, so a rollback emits nothing
+    rather than a phantom activation. The tenant lookup supplies the coarse
+    `plan` property and the internal-tenant suppression the emit seam expects.
+    """
+    try:
+        tenant = await db.get(Tenant, tenant_id)
+        if tenant is None:
+            return
+        emit_funnel_event_after_commit(
+            db,
+            "sync_credential_issued",
+            distinct_id=str(tenant.id),
+            properties={"plan": tenant.plan},
+            is_internal=bool(getattr(tenant, "is_internal", False)),
+        )
+    except Exception:  # noqa: BLE001 - analytics must never break key issuance
+        logger.exception("event=sync_credential_issued_queue_failed tenant_id=%s", tenant_id)
+
+
 async def create_user_api_key(
     auth: AuthContext,
     db: AsyncSession,
@@ -219,6 +242,7 @@ async def create_user_api_key(
         revoked_at=None,
     )
 
+    await _queue_sync_credential_issued(db, auth.tenant_id)
     await db.commit()
     return info, raw_key
 
@@ -390,5 +414,6 @@ async def rotate_api_key(
         expires_at=None,
         revoked_at=None,
     )
+    await _queue_sync_credential_issued(db, auth.tenant_id)
     await db.commit()
     return key_info, raw_key
