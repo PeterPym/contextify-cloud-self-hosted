@@ -2,6 +2,8 @@
 
 Cloud sync and team features backend for [Contextify](https://contextify.sh).
 
+Setting this up yourself? Start with the [self-hosted setup guide](https://contextify.sh/docs/self-hosted/).
+
 ## Security Defaults
 
 - Public API docs are disabled by default. Set `ENABLE_DOCS=true` only for local development.
