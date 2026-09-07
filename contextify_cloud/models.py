@@ -865,6 +865,103 @@ class DeviceAuthorization(Base):
     )
 
 
+class QARun(Base):
+    """One disposable hosted-QA tenant lifecycle."""
+
+    __tablename__ = "qa_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    state: Mapped[str] = mapped_column(
+        Text, nullable=False, default="active", server_default="active"
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    failure_class: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["user_id", "account_id", "tenant_id"],
+            ["users.id", "users.account_id", "users.tenant_id"],
+            name="fk_qa_runs_user_account_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'tearing_down', 'teardown_failed')",
+            name="ck_qa_runs_state",
+        ),
+        Index("idx_qa_runs_expiry", "state", "expires_at"),
+    )
+
+
+class QAIdentitySlot(Base):
+    """A named identity slot owned by one QA run."""
+
+    __tablename__ = "qa_identity_slots"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("qa_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    identity_slot: Mapped[str] = mapped_column(Text, nullable=False)
+    device_authorization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("device_authorizations.id", ondelete="SET NULL"),
+        unique=True,
+    )
+    issued_api_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="SET NULL"), unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "identity_slot", name="uq_qa_identity_slot_run_name"),
+        CheckConstraint("length(identity_slot) BETWEEN 1 AND 32", name="ck_qa_identity_slot_name"),
+    )
+
+
+class QARunTombstone(Base):
+    """Secret-free proof that a QA run completed teardown."""
+
+    __tablename__ = "qa_run_tombstones"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    tenant_slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_commit: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("length(tenant_slug) BETWEEN 1 AND 63", name="ck_qa_tombstone_tenant_slug"),
+        CheckConstraint("length(source_commit) = 40", name="ck_qa_tombstone_source_commit"),
+    )
+
+
 class License(Base):
     """A purchased Local Commercial license (ct-1966).
 
@@ -927,6 +1024,9 @@ class License(Base):
     delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivery_last_error: Mapped[str | None] = mapped_column(Text)
     delivery_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Opaque Resend acceptance ID. A 'sent' row without this value is legacy
+    # application evidence only and must not satisfy hosted reconciliation.
+    delivery_provider_message_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -955,6 +1055,61 @@ class License(Base):
             "idx_licenses_delivery_retry",
             "delivery_status",
             "delivery_next_attempt_at",
+        ),
+    )
+
+
+class CommercialPurchaseReconciliation(Base):
+    """Hosted ledger joining live Stripe purchases to fulfillment evidence."""
+
+    __tablename__ = "commercial_purchase_reconciliation"
+
+    stripe_checkout_session_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    stripe_subscription_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    checkout_session_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    amount_total: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fulfillment_stage: Mapped[str] = mapped_column(
+        Text, nullable=False, default="pending", server_default="pending"
+    )
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    incident_first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    incident_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operator_alert_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="pending", server_default="pending"
+    )
+    operator_alert_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    operator_alert_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operator_alert_last_error: Mapped[str | None] = mapped_column(Text)
+    operator_alert_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operator_alert_provider_message_id: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "fulfillment_stage IN ('pending', 'missing', 'delivery_pending', "
+            "'delivery_failed', 'delivery_exhausted', 'fulfilled')",
+            name="ck_commercial_purchase_reconciliation_stage",
+        ),
+        CheckConstraint(
+            "operator_alert_status IN ('pending', 'failed', 'exhausted', 'sent', 'historical')",
+            name="ck_commercial_purchase_reconciliation_alert_status",
+        ),
+        Index(
+            "idx_commercial_purchase_reconciliation_alert",
+            "operator_alert_status",
+            "operator_alert_next_attempt_at",
+        ),
+        Index(
+            "idx_commercial_purchase_reconciliation_checkout_created_at",
+            "checkout_session_created_at",
         ),
     )
 

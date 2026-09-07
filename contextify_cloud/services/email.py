@@ -55,10 +55,26 @@ class TransactionalEmail:
     text: str
     html: str | None = None
     headers: dict[str, str] | None = None
+    idempotency_key: str | None = None
 
 
-async def send_transactional_email(message: TransactionalEmail) -> bool:
-    """Send one transactional email using Resend or the fake logger path."""
+@dataclass(frozen=True)
+class TransactionalEmailResult:
+    """Result of one transactional email request.
+
+    ``accepted`` preserves the existing local/self-hosted fake-send behavior.
+    ``provider_message_id`` is present only when Resend returned a valid
+    acceptance identifier, so hosted fulfillment proof must require both.
+    """
+
+    accepted: bool
+    provider_message_id: str | None = None
+
+
+async def send_transactional_email_result(
+    message: TransactionalEmail,
+) -> TransactionalEmailResult:
+    """Send one email and retain Resend's opaque acceptance identifier."""
     if settings.dev_allow_fake_transactional_email:
         if not settings.self_hosted and not (
             is_dev_email_url(settings.email_base_url)
@@ -67,37 +83,27 @@ async def send_transactional_email(message: TransactionalEmail) -> bool:
             logger.error(
                 "event=fake_email_delivery_refused "
                 "DEV_ALLOW_FAKE_TRANSACTIONAL_EMAIL refused for non-dev "
-                "hosted URLs. Email not sent. to=%s subject=%s",
-                message.to_email,
-                message.subject,
+                "hosted URLs. Email not sent."
             )
-            return False
+            return TransactionalEmailResult(accepted=False)
         logger.warning(
             "event=fake_email_delivery "
-            "DEV_ALLOW_FAKE_TRANSACTIONAL_EMAIL enabled. "
-            "Email not sent. to=%s subject=%s",
-            message.to_email,
-            message.subject,
+            "DEV_ALLOW_FAKE_TRANSACTIONAL_EMAIL enabled. Email not sent."
         )
-        return True
+        return TransactionalEmailResult(accepted=True)
 
     if not settings.resend_api_key:
         if not settings.self_hosted:
             logger.error(
                 "event=auth_email_delivery_unconfigured "
-                "RESEND_API_KEY missing in managed mode. Email not sent. "
-                "to=%s subject=%s",
-                message.to_email,
-                message.subject,
+                "RESEND_API_KEY missing in managed mode. Email not sent."
             )
-            return False
+            return TransactionalEmailResult(accepted=False)
         logger.warning(
             "event=fake_email_delivery "
-            "RESEND_API_KEY not configured. Email not sent. to=%s subject=%s",
-            message.to_email,
-            message.subject,
+            "RESEND_API_KEY not configured. Email not sent."
         )
-        return True
+        return TransactionalEmailResult(accepted=True)
 
     payload: dict[str, object] = {
         "from": settings.email_from,
@@ -121,31 +127,48 @@ async def send_transactional_email(message: TransactionalEmail) -> bool:
     if message.headers:
         payload["headers"] = message.headers
 
+    request_headers = {
+        "Authorization": f"Bearer {settings.resend_api_key}",
+        "Content-Type": "application/json",
+    }
+    if message.idempotency_key:
+        request_headers["Idempotency-Key"] = message.idempotency_key
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {settings.resend_api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=request_headers,
                 json=payload,
             )
     except httpx.HTTPError:
-        logger.exception(
-            "Resend email send failed: transport error to=%s subject=%s",
-            message.to_email,
-            message.subject,
-        )
-        return False
-    if response.status_code >= 400:
+        logger.exception("event=resend_email_send_failed reason=transport")
+        return TransactionalEmailResult(accepted=False)
+    if not 200 <= response.status_code < 300:
         logger.error(
-            "Resend email send failed: status=%s to=%s",
+            "event=resend_email_send_failed reason=http_status status=%s",
             response.status_code,
-            message.to_email,
         )
-        return False
-    return True
+        return TransactionalEmailResult(accepted=False)
+    try:
+        response_body = response.json()
+    except ValueError:
+        logger.error("event=resend_email_send_failed reason=invalid_json")
+        return TransactionalEmailResult(accepted=False)
+    provider_message_id = response_body.get("id") if isinstance(response_body, dict) else None
+    if not isinstance(provider_message_id, str) or not provider_message_id.strip():
+        logger.error("event=resend_email_send_failed reason=missing_provider_id")
+        return TransactionalEmailResult(accepted=False)
+    return TransactionalEmailResult(
+        accepted=True,
+        provider_message_id=provider_message_id.strip(),
+    )
+
+
+async def send_transactional_email(message: TransactionalEmail) -> bool:
+    """Boolean compatibility wrapper for existing email workflows."""
+    result = await send_transactional_email_result(message)
+    return result.accepted
 
 
 def _classify_signup_platform(user_agent: str | None) -> str:
@@ -253,6 +276,32 @@ async def send_local_commercial_license_email(
     )
 
 
+async def send_local_commercial_license_email_result(
+    to_email: str,
+    license_token: str,
+    expires_at: datetime,
+    *,
+    idempotency_key: str,
+) -> TransactionalEmailResult:
+    """Deliver a Local Commercial license and retain provider acceptance."""
+    context: dict[str, object] = {
+        "license_token": license_token,
+        "expires_date": expires_at.strftime("%B %d, %Y"),
+        **_email_template_defaults(),
+    }
+    text = _render_email_template("email/local_commercial_license.txt", **context)
+    html = _render_email_template("email/local_commercial_license.html", **context)
+    return await send_transactional_email_result(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Your Contextify Local Commercial license",
+            text=text,
+            html=html,
+            idempotency_key=idempotency_key,
+        )
+    )
+
+
 async def send_self_hosted_pro_license_email(
     to_email: str,
     license_token: str,
@@ -282,6 +331,36 @@ async def send_self_hosted_pro_license_email(
             subject="Your Contextify Self-Hosted Pro license",
             text=text,
             html=html,
+        )
+    )
+
+
+async def send_self_hosted_pro_license_email_result(
+    to_email: str,
+    license_token: str,
+    expires_at: datetime,
+    company: str,
+    seats: int,
+    *,
+    idempotency_key: str,
+) -> TransactionalEmailResult:
+    """Deliver a Self-Hosted Pro license and retain provider acceptance."""
+    context: dict[str, object] = {
+        "license_token": license_token,
+        "expires_date": expires_at.strftime("%B %d, %Y"),
+        "company": company,
+        "seats": seats,
+        **_email_template_defaults(),
+    }
+    text = _render_email_template("email/self_hosted_pro_license.txt", **context)
+    html = _render_email_template("email/self_hosted_pro_license.html", **context)
+    return await send_transactional_email_result(
+        TransactionalEmail(
+            to_email=to_email,
+            subject="Your Contextify Self-Hosted Pro license",
+            text=text,
+            html=html,
+            idempotency_key=idempotency_key,
         )
     )
 

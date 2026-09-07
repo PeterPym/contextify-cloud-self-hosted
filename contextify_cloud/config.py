@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     license_delivery_max_attempts: int = 5
     license_delivery_retry_delay_seconds: int = 300
     license_delivery_outbox_interval_seconds: int = 60
+    # Hosted paid-purchase reconciliation. Polling Stripe independently of the
+    # webhook makes paid-but-unfulfilled purchases visible to the operator.
+    commercial_reconciliation_interval_seconds: int = 7_200  # 2 hours
+    commercial_reconciliation_bootstrap_seconds: int = 7_776_000  # 90 days
+    commercial_reconciliation_overlap_seconds: int = 86_400  # 1 day
+    commercial_fulfillment_grace_seconds: int = 1_800  # 30 minutes
+    commercial_operator_alert_retry_seconds: int = 300
+    commercial_operator_alert_max_attempts: int = 5
+    # Purchases before this incident cutover already followed the legacy
+    # webhook notification path. Suppress only their replacement ledger email
+    # so bootstrap reconciliation does not notify the operator twice.
+    commercial_operator_alert_cutover_epoch: int = 1_786_555_800
     # ct-3303: how long shutdown waits for in-flight funnel sends before giving up.
     # Defaults to the funnel backend's own HTTP timeout: a shorter bound would
     # guarantee dropping healthy sends, and a longer one only helps when the
@@ -81,6 +93,17 @@ class Settings(BaseSettings):
     # Deployment mode
     cloud_profile: str = ""
     self_hosted: bool = False
+    # Disposable-tenant QA profile. These values are ignored outside
+    # CLOUD_PROFILE=hosted_qa and are validated together at startup.
+    qa_public_origin: str = ""
+    qa_database_name: str = ""
+    qa_admin_token: str = ""
+    qa_allowed_cidrs: str = ""
+    qa_run_ttl_seconds: int = 3600
+    qa_reaper_interval_seconds: int = 60
+    qa_admin_max_failures: int = 5
+    qa_admin_lockout_seconds: int = 300
+    qa_source_commit: str = ""
     commercial_license_key: str = ""
     # Ed25519 private signing key (base64url, raw 32 bytes) for the Local
     # Commercial purchase webhook (ct-1966). Held ONLY by the cloud; mints
@@ -281,6 +304,15 @@ class Settings(BaseSettings):
         "auth_email_delivery_max_attempts",
         "auth_email_retry_delay_seconds",
         "auth_email_outbox_interval_seconds",
+        "license_delivery_max_attempts",
+        "license_delivery_retry_delay_seconds",
+        "license_delivery_outbox_interval_seconds",
+        "commercial_reconciliation_interval_seconds",
+        "commercial_reconciliation_bootstrap_seconds",
+        "commercial_reconciliation_overlap_seconds",
+        "commercial_fulfillment_grace_seconds",
+        "commercial_operator_alert_retry_seconds",
+        "commercial_operator_alert_max_attempts",
     )
     @classmethod
     def validate_positive_integer_settings(cls, value: int) -> int:

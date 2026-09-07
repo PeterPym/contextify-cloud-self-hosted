@@ -1,6 +1,7 @@
 """FastAPI application factory and profile-aware route registration."""
 
 import asyncio
+import ipaddress
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -38,6 +39,7 @@ init_error_monitoring()
 logger = logging.getLogger(__name__)
 
 HOSTED_CONTEXTIFY_HOST = "cloud.contextify.sh"
+HOSTED_QA_ORIGIN = "https://qa-cloud.contextify.sh"
 
 
 def _is_hosted_contextify_url(value: str) -> bool:
@@ -65,7 +67,47 @@ def _is_absolute_http_url(value: str) -> bool:
 def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
     """Reject boots that would emit unsafe defaults or hosted-domain leakage."""
     resolved_profile = profile or profile_from_settings(settings)
-    is_self_hosted = resolved_profile is not CloudProfile.HOSTED
+    is_self_hosted = resolved_profile in {
+        CloudProfile.SELF_HOSTED_PERSONAL,
+        CloudProfile.SELF_HOSTED_COMMERCIAL,
+    }
+    if resolved_profile is CloudProfile.HOSTED_QA:
+        if settings.qa_public_origin.rstrip("/") != HOSTED_QA_ORIGIN:
+            raise RuntimeError(
+                f"QA_PUBLIC_ORIGIN must be exactly {HOSTED_QA_ORIGIN!r} for hosted_qa."
+            )
+        configured_database = urlsplit(settings.database_url).path.lstrip("/")
+        if not settings.qa_database_name or configured_database != settings.qa_database_name:
+            raise RuntimeError(
+                "QA_DATABASE_NAME must be non-empty and match the database in DATABASE_URL."
+            )
+        if settings.qa_database_name in {"contextify", "contextify_cloud", "production"}:
+            raise RuntimeError("QA_DATABASE_NAME must identify a dedicated QA database.")
+        if len(settings.qa_admin_token) < MIN_SUPPORT_ADMIN_TOKEN_LENGTH:
+            raise RuntimeError("QA_ADMIN_TOKEN must be at least 32 characters for hosted_qa.")
+        if len(settings.qa_source_commit) != 40 or any(
+            char not in "0123456789abcdef" for char in settings.qa_source_commit.lower()
+        ):
+            raise RuntimeError("QA_SOURCE_COMMIT must be an exact 40-character Git SHA.")
+        positive_qa_settings = {
+            "QA_RUN_TTL_SECONDS": settings.qa_run_ttl_seconds,
+            "QA_REAPER_INTERVAL_SECONDS": settings.qa_reaper_interval_seconds,
+            "QA_ADMIN_MAX_FAILURES": settings.qa_admin_max_failures,
+            "QA_ADMIN_LOCKOUT_SECONDS": settings.qa_admin_lockout_seconds,
+        }
+        invalid_setting = next(
+            (name for name, value in positive_qa_settings.items() if value <= 0), None
+        )
+        if invalid_setting:
+            raise RuntimeError(f"{invalid_setting} must be greater than zero for hosted_qa.")
+        cidrs = [item.strip() for item in settings.qa_allowed_cidrs.split(",") if item.strip()]
+        if not cidrs:
+            raise RuntimeError("QA_ALLOWED_CIDRS must be configured for hosted_qa.")
+        try:
+            for cidr in cidrs:
+                ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise RuntimeError("QA_ALLOWED_CIDRS contains an invalid network.") from exc
     if settings.api_secret_key == DEFAULT_API_SECRET_KEY:
         raise RuntimeError(
             "API_SECRET_KEY must be set to a non-default value. "
@@ -121,7 +163,7 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
             "cookies are emitted with Secure=True regardless of proxy topology."
         )
     if (
-        not is_self_hosted
+        resolved_profile is CloudProfile.HOSTED
         and settings.dev_allow_fake_transactional_email
         and not (
             is_dev_email_url(settings.email_base_url)
@@ -133,7 +175,7 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
             "loopback, or .test EMAIL_BASE_URL and INVITATION_BASE_URL values."
         )
     if (
-        not is_self_hosted
+        resolved_profile is CloudProfile.HOSTED
         and not settings.resend_api_key
         and not settings.dev_allow_fake_transactional_email
     ):
@@ -142,7 +184,7 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
             "Hosted production must use real transactional email delivery for "
             "verification, password reset, and email change workflows."
         )
-    if not is_self_hosted and settings.email_from == DEFAULT_EMAIL_FROM:
+    if resolved_profile is CloudProfile.HOSTED and settings.email_from == DEFAULT_EMAIL_FROM:
         raise RuntimeError(
             f"EMAIL_FROM must be set to a verified Resend sending address when "
             f"SELF_HOSTED=false. The default value {DEFAULT_EMAIL_FROM!r} is for "
@@ -288,15 +330,96 @@ async def _license_delivery_outbox_scheduler_loop() -> None:
             )
 
 
+async def _commercial_purchase_reconciliation_scheduler_loop() -> None:
+    """Periodically reconcile live Stripe purchases against fulfillment."""
+    from contextify_cloud import monitoring
+    from contextify_cloud.hosted.stripe_fulfillment_reconciliation import (
+        run_commercial_purchase_reconciliation_once,
+    )
+
+    logger.info(
+        "Commercial purchase reconciliation scheduler started (interval=%ds)",
+        settings.commercial_reconciliation_interval_seconds,
+    )
+    phase = "startup"
+    while True:
+        try:
+            result = await run_commercial_purchase_reconciliation_once()
+            if result.scanned or result.incidents or result.operator_alerts_sent or result.errors:
+                logger.info(
+                    "Commercial purchase reconciliation: "
+                    "scanned=%d recorded=%d fulfilled=%d pending=%d "
+                    "incidents=%d operator_alerts=%d skipped_locked=%s errors=%d",
+                    result.scanned,
+                    result.recorded,
+                    result.fulfilled,
+                    result.pending,
+                    result.incidents,
+                    result.operator_alerts_sent,
+                    result.skipped_locked,
+                    len(result.errors),
+                )
+        except Exception as exc:
+            logger.error("Commercial purchase reconciliation failed", exc_info=True)
+            monitoring.capture_background_exception(
+                exc,
+                job="commercial_purchase_reconciliation",
+                phase=phase,
+            )
+        phase = "scheduled"
+        await asyncio.sleep(settings.commercial_reconciliation_interval_seconds)
+
+
+async def _qa_reaper_loop() -> None:
+    """Reap expired QA runs on a bounded cadence after startup cleanup."""
+    from contextify_cloud.database import async_session_factory
+    from contextify_cloud.services.qa_runs import QARunError, reap_expired_runs
+
+    while True:
+        await asyncio.sleep(settings.qa_reaper_interval_seconds)
+        try:
+            async with async_session_factory() as db:
+                try:
+                    await reap_expired_runs(db)
+                except QARunError:
+                    await db.commit()
+                    logger.exception("QA reaper persisted fail-closed teardown state")
+                else:
+                    await db.commit()
+        except Exception:
+            logger.exception("QA reaper sweep failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     profile = getattr(app.state, "cloud_profile", None)
     validate_runtime_settings(profile)
 
-    purge_task = asyncio.create_task(_purge_scheduler_loop())
-    auth_email_outbox_task = asyncio.create_task(_auth_email_outbox_scheduler_loop())
-    license_delivery_task = asyncio.create_task(_license_delivery_outbox_scheduler_loop())
-    background_tasks = (purge_task, auth_email_outbox_task, license_delivery_task)
+    if profile is CloudProfile.HOSTED_QA:
+        # The coroutine performs its first sweep before its first sleep. Await
+        # that sweep directly so readiness is never published on cleanup error.
+        from contextify_cloud.database import async_session_factory
+        from contextify_cloud.services.qa_runs import QARunError, reap_expired_runs
+
+        async with async_session_factory() as db:
+            try:
+                await reap_expired_runs(db)
+            except QARunError:
+                await db.commit()
+                raise
+            else:
+                await db.commit()
+        background_tasks = [asyncio.create_task(_qa_reaper_loop())]
+    else:
+        background_tasks = [
+            asyncio.create_task(_purge_scheduler_loop()),
+            asyncio.create_task(_auth_email_outbox_scheduler_loop()),
+            asyncio.create_task(_license_delivery_outbox_scheduler_loop()),
+        ]
+    if profile is CloudProfile.HOSTED:
+        background_tasks.append(
+            asyncio.create_task(_commercial_purchase_reconciliation_scheduler_loop())
+        )
     try:
         yield
     finally:
@@ -584,6 +707,13 @@ def _include_commercial_self_hosted_routers(app: FastAPI) -> None:
     app.include_router(tenant_admin.router, dependencies=license_dependency)
 
 
+def _include_qa_routers(app: FastAPI) -> None:
+    """Register disposable QA administration only in the hosted QA profile."""
+    from contextify_cloud.routers import internal_qa
+
+    app.include_router(internal_qa.router)
+
+
 def create_app(profile: CloudProfile | None = None) -> FastAPI:
     """Build the FastAPI app for the requested runtime profile.
 
@@ -610,6 +740,8 @@ def create_app(profile: CloudProfile | None = None) -> FastAPI:
 
     if resolved_profile is CloudProfile.HOSTED:
         _include_hosted_routers(app)
+    elif resolved_profile is CloudProfile.HOSTED_QA:
+        _include_qa_routers(app)
     elif resolved_profile is CloudProfile.SELF_HOSTED_COMMERCIAL:
         _include_commercial_self_hosted_routers(app)
 

@@ -654,6 +654,74 @@ def capture_background_exception(
     )
 
 
+def capture_commercial_fulfillment_mismatch(
+    *,
+    stripe_checkout_session_id: str,
+    stripe_subscription_id: str,
+    stage: str,
+) -> bool:
+    """Capture one redacted paid-but-unfulfilled purchase invariant."""
+    if not is_error_monitoring_active():
+        return False
+
+    context = {
+        "fingerprint": [
+            "commercial_fulfillment_mismatch",
+            stripe_checkout_session_id,
+        ],
+        "request": {
+            "stripe_checkout_session_id": stripe_checkout_session_id,
+            "stripe_subscription_id": stripe_subscription_id,
+            "stage": stage,
+        },
+        "tags": {
+            "event_kind": "commercial_fulfillment_mismatch",
+            "job": "commercial_purchase_reconciliation",
+            "stage": stage,
+        },
+    }
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_message(
+            "Paid Local Commercial purchase is not fulfilled",
+            level="error",
+        ),
+    )
+    return True
+
+
+def capture_commercial_operator_alert_failure(
+    *,
+    stripe_checkout_session_id: str,
+    stripe_subscription_id: str,
+) -> None:
+    """Capture exhaustion of the independent paid-purchase operator alert."""
+    if not is_error_monitoring_active():
+        return
+
+    context = {
+        "fingerprint": [
+            "commercial_operator_alert_exhausted",
+            stripe_checkout_session_id,
+        ],
+        "request": {
+            "stripe_checkout_session_id": stripe_checkout_session_id,
+            "stripe_subscription_id": stripe_subscription_id,
+        },
+        "tags": {
+            "event_kind": "commercial_operator_alert_exhausted",
+            "job": "commercial_purchase_reconciliation",
+        },
+    }
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_message(
+            "Paid-purchase operator alert exhausted",
+            level="error",
+        ),
+    )
+
+
 def sanitize_pydantic_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Strip the `input` field from Pydantic error dicts before exposing them.
 

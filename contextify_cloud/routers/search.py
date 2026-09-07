@@ -159,7 +159,9 @@ async def search(
     # in Python before replacing sentinels with <b>/<\/b>, preventing XSS from
     # user-provided transcript content.
     search_sql = f"""
-        SELECT e.id, e.content, e.kind, e.timestamp,
+        SELECT e.id, e.content,
+               octet_length(convert_to(coalesce(e.content, ''), 'UTF8')) as content_byte_size,
+               e.kind, e.timestamp,
                ts_rank_cd(e.search_vector, plainto_tsquery('english', :query)) as score,
                ts_headline(
                    'english', coalesce(e.content, ''), plainto_tsquery('english', :query),
@@ -185,10 +187,17 @@ async def search(
 
     results = []
     for row in rows:
-        # Truncate full content for response (optional field for clients)
-        content = row.content or ""
-        if len(content) > 500:
-            content = content[:500] + "..."
+        # Truncate full content for response (optional field for clients). Report the full
+        # pre-truncation byte size and whether we clipped, so a client can show an accurate
+        # size line and a "truncated" marker without a second fetch. Byte size is computed in
+        # Postgres (octet_length of convert_to(..., 'UTF8')) so we do not re-encode the full
+        # (possibly multi-MB) content per row on the event loop; only the 500-char prefix is
+        # returned. convert_to fixes the count to UTF-8 bytes regardless of server encoding,
+        # matching the field's contract.
+        full_content = row.content or ""
+        content_byte_size = row.content_byte_size
+        content_truncated = len(full_content) > 500
+        content = full_content[:500] + "..." if content_truncated else full_content
 
         # XSS-safe snippet: HTML-escape user content, then replace sentinels
         # with <b>/<\/b> tags for highlighting. This ensures user-provided
@@ -206,6 +215,8 @@ async def search(
             snippet=safe_snippet,
             score=row.score,
             content=content,
+            content_truncated=content_truncated,
+            content_byte_size=content_byte_size,
             project_name=row.project_name,
             user_name=row.user_name,
             user_email=row.user_email,

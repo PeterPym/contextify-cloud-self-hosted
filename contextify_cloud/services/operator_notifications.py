@@ -23,8 +23,10 @@ import logging
 from contextify_cloud.config import settings
 from contextify_cloud.services.email import (
     TransactionalEmail,
+    TransactionalEmailResult,
     _classify_signup_platform,
     send_transactional_email,
+    send_transactional_email_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,6 +226,40 @@ async def notify_local_commercial_purchase(
         text=text,
         important=True,
     )
+
+
+async def send_local_commercial_purchase_alert_result(
+    *,
+    customer_email: str | None,
+    stripe_checkout_session_id: str,
+    stripe_subscription_id: str,
+    amount: str,
+    idempotency_key: str,
+) -> TransactionalEmailResult:
+    """Send the ledger-owned paid-purchase alert with provider evidence."""
+    if not _operator_notifications_enabled():
+        return TransactionalEmailResult(accepted=False)
+    who = customer_email or "(see Stripe customer record)"
+    text = (
+        "A Local Commercial license was just purchased.\n\n"
+        f"Customer:     {who}\n"
+        f"Amount:       {amount}\n"
+        f"Checkout:     {stripe_checkout_session_id}\n"
+        f"Subscription: {stripe_subscription_id}\n"
+    )
+    try:
+        return await send_transactional_email_result(
+            TransactionalEmail(
+                to_email=settings.operator_notification_email,
+                subject="[IMPORTANT] Local Commercial purchase",
+                text=text,
+                headers=_IMPORTANT_HEADERS,
+                idempotency_key=idempotency_key,
+            )
+        )
+    except Exception:  # noqa: BLE001 - the ledger owns retry state
+        logger.exception("event=operator_purchase_alert_failed")
+        return TransactionalEmailResult(accepted=False)
 
 
 async def notify_subscription_cancelled(

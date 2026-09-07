@@ -12,7 +12,41 @@ from pydantic import (
     model_validator,
 )
 
+
+class QARunCreateRequest(BaseModel):
+    run_id: uuid.UUID
+    identity_slots: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+    ] = Field(min_length=2, max_length=8)
+    ttl_seconds: int | None = Field(default=None, ge=60, le=86400)
+
+
+class QARunResponse(BaseModel):
+    run_id: uuid.UUID
+    tenant_id: uuid.UUID
+    state: Literal["active", "tearing_down", "teardown_failed", "deleted"]
+    expires_at: datetime | None = None
+
+
+class QAApprovalRequest(BaseModel):
+    identity_slot: str = Field(min_length=1, max_length=32)
+    user_code: str = Field(min_length=9, max_length=9)
+
+
+class QAApprovalResponse(BaseModel):
+    run_id: uuid.UUID
+    identity_slot: str
+    state: Literal["approved"]
+
+
+class QAResidueResponse(BaseModel):
+    run_id: uuid.UUID
+    state: Literal["present", "absent", "teardown_failed"]
+    residue: dict[str, int]
+
+
 # --- Auth ---
+
 
 class RegisterRequest(BaseModel):
     email: str
@@ -57,6 +91,7 @@ class BrowserHandoffResponse(BaseModel):
 
 # --- Sync ---
 
+
 class DeviceInfo(BaseModel):
     machine_id: str
     machine_name: str
@@ -91,7 +126,7 @@ class SyncTranscript(BaseModel):
 
 
 _PER_CHUNK_BYTE_CAP = 1_000_000  # 1 MB UTF-8 bytes per chunk
-_MAX_CHUNKS_PER_ENTRY = 40        # 40 * 900 KB ~= 36 MB, below 50 MB body cap
+_MAX_CHUNKS_PER_ENTRY = 40  # 40 * 900 KB ~= 36 MB, below 50 MB body cap
 
 
 class SyncEntry(BaseModel):
@@ -111,7 +146,9 @@ class SyncEntry(BaseModel):
     content: str | None = Field(default=None)
     content_chunks: list[str] | None = Field(default=None, max_length=_MAX_CHUNKS_PER_ENTRY)
     content_sha256: str = Field(
-        ..., min_length=64, max_length=64,
+        ...,
+        min_length=64,
+        max_length=64,
     )  # SHA-256 = 64 hex chars
     display_in_timeline: bool = True
     git_branch: str | None = None
@@ -135,16 +172,12 @@ class SyncEntry(BaseModel):
         has_content = self.content is not None
         has_chunks = self.content_chunks is not None
         if has_content == has_chunks:
-            raise ValueError(
-                "exactly one of `content` or `content_chunks` must be set"
-            )
+            raise ValueError("exactly one of `content` or `content_chunks` must be set")
         if has_chunks:
             assert self.content_chunks is not None  # narrowing
             for i, chunk in enumerate(self.content_chunks):
                 if len(chunk.encode("utf-8")) > _PER_CHUNK_BYTE_CAP:
-                    raise ValueError(
-                        f"`content_chunks[{i}]` exceeds 1 MB UTF-8 bytes"
-                    )
+                    raise ValueError(f"`content_chunks[{i}]` exceeds 1 MB UTF-8 bytes")
         return self
 
     def materialized_content(self) -> str:
@@ -224,7 +257,8 @@ class SyncPushRequest(BaseModel):
         description="Client-generated UUID to prevent duplicate batch processing",
     )
     batch_seq: int | None = Field(
-        None, ge=0,
+        None,
+        ge=0,
         description="Sequence number within a multi-batch sync session",
     )
     sync_session_id: str | None = Field(
@@ -232,11 +266,13 @@ class SyncPushRequest(BaseModel):
         description="Server-generated session ID for multi-batch resume",
     )
     entries_sent: int | None = Field(
-        None, ge=0,
+        None,
+        ge=0,
         description="Optional client-declared entries count for sanity checks",
     )
     total_batches: int | None = Field(
-        None, ge=0,
+        None,
+        ge=0,
         description="Client-estimated total batches for the push session",
     )
     device: DeviceInfo
@@ -269,9 +305,7 @@ class SyncItemError(BaseModel):
     never raw user content from Pydantic `input`.
     """
 
-    item_kind: Literal[
-        "entry", "summary", "usage", "tool_invocation", "transcript_metadata"
-    ]
+    item_kind: Literal["entry", "summary", "usage", "tool_invocation", "transcript_metadata"]
     index: int | None = None
     item_id: str | None = None
     error_code: str
@@ -298,9 +332,9 @@ class SyncPushResponse(BaseModel):
     entries_retriable_failed: int = 0
     entries_resolved: int = 0
     checkpoint_safe: bool = False
-    completion_state: Literal[
-        "in_progress", "success", "completed_with_issues", "blocked"
-    ] = "in_progress"
+    completion_state: Literal["in_progress", "success", "completed_with_issues", "blocked"] = (
+        "in_progress"
+    )
     needs_attention_count: int = 0
     error_codes: list[str] = Field(default_factory=list)
     # ct-1841: structured per-item errors. Uncapped by count so clients can
@@ -326,9 +360,9 @@ class ActivePushSessionStatus(BaseModel):
     throughput_entries_per_min: float | None = None
     eta_seconds: int | None = None
     checkpoint_safe: bool | None = None
-    completion_state: Literal[
-        "in_progress", "success", "completed_with_issues", "blocked"
-    ] = "in_progress"
+    completion_state: Literal["in_progress", "success", "completed_with_issues", "blocked"] = (
+        "in_progress"
+    )
     needs_attention_count: int = 0
     last_batch_at: datetime | None = None
 
@@ -344,8 +378,10 @@ class SyncStatusResponse(BaseModel):
 
 # --- Sync Pull ---
 
+
 class PullEntry(BaseModel):
     """An entry returned from the pull endpoint."""
+
     id: str
     transcript_id: str
     project_id: str
@@ -402,6 +438,7 @@ class SyncPullResponse(BaseModel):
 
 # --- Search ---
 
+
 class SearchResult(BaseModel):
     """Individual search result with relevance scoring and highlighted snippet."""
 
@@ -413,6 +450,14 @@ class SearchResult(BaseModel):
     snippet: str  # ts_headline highlighted excerpt
     score: float  # ts_rank_cd relevance score
     content: str | None = None  # Full content (truncated), for clients that need it
+    # content is truncated to a fixed prefix in the response. These let a client (e.g. the
+    # Windows console size line, and teammate-hit signals) show that an entry was clipped and
+    # how large the full entry is, without a second fetch. content_byte_size is the utf-8 byte
+    # size of the FULL pre-truncation content; content_truncated is True when content is a
+    # prefix of it. Optional with defaults, so older clients ignore them and no client release
+    # is forced.
+    content_truncated: bool = False
+    content_byte_size: int = 0
     project_name: str | None = None
     user_name: str | None = None
     user_email: str | None = None
@@ -539,9 +584,7 @@ class SelfHostedProCheckoutRequest(BaseModel):
     admin_contact: EmailStr = Field(
         ..., description="Billing/admin contact email; the license key is sent here"
     )
-    seats: int = Field(
-        ..., ge=3, le=10000, description="Seat count (three-seat minimum)"
-    )
+    seats: int = Field(..., ge=3, le=10000, description="Seat count (three-seat minimum)")
     success_url: str = Field(..., description="URL to redirect after successful payment")
     cancel_url: str = Field(..., description="URL to redirect if checkout is cancelled")
 
@@ -796,6 +839,7 @@ class TeamActivityResponse(BaseModel):
 
 
 # --- Health ---
+
 
 class HealthResponse(BaseModel):
     status: str = "ok"

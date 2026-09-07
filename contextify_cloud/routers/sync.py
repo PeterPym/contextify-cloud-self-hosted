@@ -15,6 +15,7 @@ from fastapi import Request as HttpRequest
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
@@ -1915,6 +1916,22 @@ async def sync_pull(
         logger.error("Unsafe tenant schema name: %r", schema)
         raise HTTPException(status_code=500, detail="Internal configuration error.")
 
+    # nextval allocation is not commit ordering: an uncommitted lower sequence
+    # must not become visible after we checkpoint a higher one. SHARE conflicts
+    # with entry writers' ROW EXCLUSIVE locks and lasts through the page commit,
+    # making this page a stable committed boundary. NOWAIT avoids queueing a
+    # pull (and its auth-row lock) behind a long upload. Other tenants are unaffected.
+    try:
+        await db.execute(text(f"LOCK TABLE {schema}.transcript_entries IN SHARE MODE NOWAIT"))
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "55P03":
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="Sync writes are in progress. Retry this pull with the same cursor.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
     # Query entries with server_sequence > since, fetch limit+1 to detect has_more.
     # User scoping: members only see their own entries; owners/admins see all.
     scope_clause, scope_params = build_user_scope_clause(auth)
@@ -2087,7 +2104,7 @@ async def sync_pull(
         since,
     )
 
-    return SyncPullResponse(
+    response = SyncPullResponse(
         entries=entries,
         projects=projects,
         transcripts=transcripts,
@@ -2096,6 +2113,10 @@ async def sync_pull(
         next_cursor=next_cursor,
         server_sequence=current_server_sequence,
     )
+    # Release the page lock before FastAPI transmits the response. Request-scope
+    # yield teardown can otherwise keep it held behind a slow network reader.
+    await db.commit()
+    return response
 
 
 @router.get("/status", response_model=SyncStatusResponse)

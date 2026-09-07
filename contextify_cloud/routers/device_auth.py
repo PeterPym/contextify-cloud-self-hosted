@@ -55,6 +55,7 @@ from contextify_cloud.middleware.public_csrf import (
     set_public_csrf_cookie,
 )
 from contextify_cloud.models import Account, ApiKey, AuthToken, DeviceAuthorization, Tenant, User
+from contextify_cloud.profiles import CloudProfile
 from contextify_cloud.schemas import (
     DeviceCodeRequest,
     DeviceCodeResponse,
@@ -170,9 +171,7 @@ async def request_device_code(
     # ct-1512 followup: RFC 8628 §3.2 — embed the user_code as a query
     # parameter so the macOS app's "Open in Browser" button can navigate
     # directly to a page that auto-fills the code (no copy-paste step).
-    verification_uri_complete = (
-        f"{verification_uri}?user_code={quote(user_code, safe='')}"
-    )
+    verification_uri_complete = f"{verification_uri}?user_code={quote(user_code, safe='')}"
     expires_at = datetime.now(UTC) + timedelta(seconds=settings.device_code_expiry_seconds)
     client_ip = request.client.host if request.client else None
 
@@ -191,7 +190,9 @@ async def request_device_code(
 
     logger.info(
         "Device code issued: user_code_prefix=%s client_name=%s client_ip=%s",
-        _redact_user_code(user_code), body.client_name, client_ip,
+        _redact_user_code(user_code),
+        body.client_name,
+        client_ip,
     )
 
     return DeviceCodeResponse(
@@ -223,18 +224,36 @@ async def poll_device_token(
             "grant_type must be 'urn:ietf:params:oauth:grant-type:device_code'.",
         )
 
-    # Look up the device authorization (row lock prevents race conditions)
-    result = await db.execute(
-        select(DeviceAuthorization)
-        .where(
-            or_(
-                DeviceAuthorization.device_code_hash == hash_device_code(body.device_code),
-                DeviceAuthorization.device_code == body.device_code,
-            )
+    code_hash = hash_device_code(body.device_code)
+    qa_bound = False
+    is_hosted_qa = request.app.state.cloud_profile is CloudProfile.HOSTED_QA
+    device_auth = None
+    if is_hosted_qa:
+        from contextify_cloud.services.qa_runs import (
+            QARunError,
+            lock_qa_authorization_for_token,
         )
-        .with_for_update()
-    )
-    device_auth = result.scalar_one_or_none()
+
+        try:
+            device_auth = await lock_qa_authorization_for_token(
+                db, device_code_hash=code_hash, raw_device_code=body.device_code
+            )
+        except QARunError:
+            return device_error("access_denied", "The QA run is inactive or expired.")
+    if device_auth is not None:
+        qa_bound = True
+    else:
+        result = await db.execute(
+            select(DeviceAuthorization)
+            .where(
+                or_(
+                    DeviceAuthorization.device_code_hash == code_hash,
+                    DeviceAuthorization.device_code == body.device_code,
+                )
+            )
+            .with_for_update()
+        )
+        device_auth = result.scalar_one_or_none()
 
     if not device_auth:
         return device_error("invalid_grant", "Unknown device code.")
@@ -292,6 +311,15 @@ async def poll_device_token(
     if device_auth.status != "authorized":
         return device_error("authorization_pending", "The user has not yet authorized this device.")
 
+    if is_hosted_qa and not qa_bound:
+        from contextify_cloud.services.qa_runs import qa_association_appeared
+
+        if await qa_association_appeared(db, device_auth.id):
+            # Approval committed after the ordinary-path decision. Do not issue
+            # a key under the inverse authorization-first lock order. A bounded
+            # next poll restarts through run, slot, authorization order.
+            return device_error("authorization_pending", "Authorization is being finalized.")
+
     # Status is "authorized" - generate API key and complete the flow
     user_id = device_auth.user_id
     tenant_id = device_auth.tenant_id
@@ -329,9 +357,10 @@ async def poll_device_token(
 
     if not user:
         logger.error(
-            "Device auth %s: authorized user/tenant no longer valid "
-            "(user_id=%s, tenant_id=%s)",
-            device_auth.id, user_id, tenant_id,
+            "Device auth %s: authorized user/tenant no longer valid (user_id=%s, tenant_id=%s)",
+            device_auth.id,
+            user_id,
+            tenant_id,
         )
         await db.execute(
             update(DeviceAuthorization)
@@ -340,16 +369,15 @@ async def poll_device_token(
         )
         return device_error("access_denied", "Authorization is no longer valid.")
 
-    tenant_result = await db.execute(
-        select(Tenant).where(Tenant.id == tenant_id)
-    )
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = tenant_result.scalar_one_or_none()
 
     if not tenant:
         logger.error(
-            "Device auth %s: authorized tenant no longer valid "
-            "(user_id=%s, tenant_id=%s)",
-            device_auth.id, user_id, tenant_id,
+            "Device auth %s: authorized tenant no longer valid (user_id=%s, tenant_id=%s)",
+            device_auth.id,
+            user_id,
+            tenant_id,
         )
         await db.execute(
             update(DeviceAuthorization)
@@ -371,6 +399,10 @@ async def poll_device_token(
     )
     db.add(api_key)
     await db.flush()
+    if qa_bound:
+        from contextify_cloud.services.qa_runs import record_qa_api_key
+
+        await record_qa_api_key(db, authorization_id=device_auth.id, api_key_id=api_key.id)
 
     # Mark authorization as completed
     await db.execute(
@@ -401,7 +433,9 @@ async def poll_device_token(
 
     logger.info(
         "Device flow completed: user=%s tenant=%s key_id=%s",
-        user.email, tenant.slug, key_id,
+        user.email,
+        tenant.slug,
+        key_id,
     )
 
     # ct-3286: the credential is not real until this request's transaction
@@ -484,12 +518,12 @@ async def email_init(
         # Route-level CSRF rejection happens BEFORE the service is invoked,
         # so route owns this funnel emission. (ct-1512 Shard C C3)
         logger.info(
-            "event=device_flow_error error_code=csrf_invalid "
-            "endpoint=email-init client_ip_hash=%s",
+            "event=device_flow_error error_code=csrf_invalid endpoint=email-init client_ip_hash=%s",
             hash_ip_for_logs(_client_ip(request)),
         )
         return _no_store_json(
-            {"error": "csrf_invalid"}, status_code=403,
+            {"error": "csrf_invalid"},
+            status_code=403,
         )
 
     client_ip = _client_ip(request)
@@ -504,7 +538,8 @@ async def email_init(
             hash_ip_for_logs(client_ip),
         )
         return _no_store_json(
-            {"error": "invalid_email"}, status_code=400,
+            {"error": "invalid_email"},
+            status_code=400,
         )
 
     device_authorization = await resolve_device_authorization(
@@ -521,7 +556,8 @@ async def email_init(
             hash_ip_for_logs(client_ip),
         )
         return _no_store_json(
-            {"error": "invalid_user_code"}, status_code=400,
+            {"error": "invalid_user_code"},
+            status_code=400,
         )
 
     # ct-1512 Shard B-1 / C-fix2: take a row-level lock on the
@@ -533,7 +569,8 @@ async def email_init(
     # row was concurrently expired or fulfilled, we treat it as
     # invalid_user_code.
     locked_device_authorization = await lock_device_authorization_for_send(
-        db, device_authorization_id=device_authorization.id,
+        db,
+        device_authorization_id=device_authorization.id,
     )
     if locked_device_authorization is None:
         logger.info(
@@ -544,12 +581,14 @@ async def email_init(
             hash_ip_for_logs(client_ip),
         )
         return _no_store_json(
-            {"error": "invalid_user_code"}, status_code=400,
+            {"error": "invalid_user_code"},
+            status_code=400,
         )
     device_authorization = locked_device_authorization
 
     if await device_email_send_cap_reached(
-        db, device_authorization_id=device_authorization.id,
+        db,
+        device_authorization_id=device_authorization.id,
     ):
         # Route-level send-cap rejection — service never runs. Cap check
         # runs *inside* the row lock above so concurrent ``email-init``
@@ -566,15 +605,14 @@ async def email_init(
             hash_ip_for_logs(client_ip),
         )
         return _no_store_json(
-            {"error": "rate_limited"}, status_code=429,
+            {"error": "rate_limited"},
+            status_code=429,
         )
 
     # Account lookup runs on EVERY branch (existing-active, new-signup,
     # disabled) — see ct-1512 Shard C C2 ``timing-strategy=equivalent-DB-work``
     # comment below.
-    account_result = await db.execute(
-        select(Account).where(Account.email_normalized == normalized)
-    )
+    account_result = await db.execute(select(Account).where(Account.email_normalized == normalized))
     account = account_result.scalar_one_or_none()
     account_status = _account_status_label(account)
 
@@ -680,7 +718,8 @@ async def email_init(
 
 
 def _build_email_init_response(
-    request: Request, payload: dict[str, object],
+    request: Request,
+    payload: dict[str, object],
 ) -> JSONResponse:
     response = _no_store_json(payload, status_code=200)
     set_public_csrf_cookie(response, request, public_csrf_token(request))
@@ -803,8 +842,7 @@ async def verify_otp(
         # ct-1512 Shard C C3: route-level CSRF rejection — service never
         # called, so route owns this funnel emission.
         logger.info(
-            "event=device_flow_error error_code=csrf_invalid "
-            "endpoint=verify-otp client_ip_hash=%s",
+            "event=device_flow_error error_code=csrf_invalid endpoint=verify-otp client_ip_hash=%s",
             hash_ip_for_logs(_client_ip(request)),
         )
         return _no_store_json({"error": "csrf_invalid"}, status_code=403)
@@ -917,7 +955,8 @@ async def _finalize_and_set_session(
 
 def _redirect_to_device_error(error_code: str) -> RedirectResponse:
     return RedirectResponse(
-        f"/cloud/device?error_code={error_code}", status_code=303,
+        f"/cloud/device?error_code={error_code}",
+        status_code=303,
     )
 
 
@@ -995,7 +1034,8 @@ def _error_copy_for(error_code: str | None) -> str | None:
 
 
 async def _classify_email_link_token(
-    db: AsyncSession, raw_token: str,
+    db: AsyncSession,
+    raw_token: str,
 ) -> str | None:
     """Return ``None`` when the token is valid, else a §6 State E error code.
 
@@ -1007,13 +1047,15 @@ async def _classify_email_link_token(
     if not raw_token or len(raw_token) < 8:
         return "token_unknown"
     from contextify_cloud.services.browser_auth import _hash_token  # local import to avoid cycle
+
     now = datetime.now(UTC)
     result = await db.execute(
         select(AuthToken).where(AuthToken.token_hash == _hash_token(raw_token))
     )
     token = result.scalar_one_or_none()
     if token is None or token.purpose not in (
-        "device_login_existing_user", "device_signup_new_user",
+        "device_login_existing_user",
+        "device_signup_new_user",
     ):
         return "token_unknown"
     if token.consumed_at is not None:

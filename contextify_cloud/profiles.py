@@ -9,6 +9,7 @@ class CloudProfile(StrEnum):
     """Supported runtime and distribution profiles."""
 
     HOSTED = "hosted"
+    HOSTED_QA = "hosted_qa"
     SELF_HOSTED_PERSONAL = "self_hosted_personal"
     SELF_HOSTED_COMMERCIAL = "self_hosted_commercial"
 
@@ -29,7 +30,7 @@ def profile_from_settings(settings_obj: Settings) -> CloudProfile:
                 f"CLOUD_PROFILE must be one of: {valid} (got {explicit!r})."
             ) from exc
 
-        if profile is CloudProfile.HOSTED and settings_obj.self_hosted:
+        if profile in {CloudProfile.HOSTED, CloudProfile.HOSTED_QA} and settings_obj.self_hosted:
             raise RuntimeError(
                 "SELF_HOSTED=true conflicts with CLOUD_PROFILE='hosted'. "
                 "Unset SELF_HOSTED or choose a self-hosted CLOUD_PROFILE."

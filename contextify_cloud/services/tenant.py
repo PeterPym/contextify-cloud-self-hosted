@@ -19,8 +19,9 @@ import asyncio
 import logging
 import re
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from contextify_cloud.middleware.auth import generate_api_key, hash_api_key
 from contextify_cloud.models import ApiKey, Tenant, User
@@ -355,8 +356,24 @@ async def ensure_tenant_schema_compat(db: AsyncSession, schema_name: str) -> Non
         for statement in _TENANT_SCHEMA_COMPAT_SQL:
             await db.execute(text(statement.replace("{schema}", schema_name)))
 
-        _ENSURED_COMPAT_SCHEMAS.add(schema_name)
-        logger.info("Ensured tenant schema compatibility for %s", schema_name)
+        # DDL locks and changes belong to the request transaction. Publishing
+        # before its outer commit lets another request skip unfinished DDL and
+        # acquire locks in the opposite order. Savepoint commits are not enough.
+        pending = True
+
+        def publish_after_commit(session: Session) -> None:
+            if pending and not session.in_nested_transaction():
+                _ENSURED_COMPAT_SCHEMAS.add(schema_name)
+
+        def discard_after_rollback(_session: Session) -> None:
+            nonlocal pending
+            # Conservatively re-ensure after even a savepoint rollback. It may
+            # have undone the DDL; a missed cache hit is safer than a false one.
+            pending = False
+
+        event.listen(db.sync_session, "after_commit", publish_after_commit)
+        event.listen(db.sync_session, "after_rollback", discard_after_rollback)
+        logger.info("Prepared tenant schema compatibility for %s", schema_name)
 
 
 async def provision_tenant(

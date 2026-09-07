@@ -12,6 +12,8 @@ engine = create_async_engine(
     pool_size=10,
     max_overflow=20,
     pool_pre_ping=True,
+    # Pull page locking requires a fresh snapshot after acquiring its table lock.
+    isolation_level="READ COMMITTED",
 )
 
 async_session_factory = async_sessionmaker(
