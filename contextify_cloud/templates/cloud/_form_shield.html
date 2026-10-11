@@ -1,0 +1,13 @@
+{# Scripted-submission checks (services/form_shield.py). Renders nothing when
+   the shield is off. static/js/form-shield.js fills the JS field. The honeypot
+   is off-screen, hidden from assistive technology and out of the tab order. #}
+{% if form_shield %}
+<input type="hidden" name="{{ form_shield.token_field }}" value="{{ form_shield.token }}">
+<input type="hidden" name="{{ form_shield.js_field }}" value="">
+<div class="ctxf-hp" aria-hidden="true">
+  <label>Leave this field empty
+    <input type="text" name="{{ form_shield.honeypot_field }}" value=""
+           tabindex="-1" autocomplete="off">
+  </label>
+</div>
+{% endif %}

@@ -654,6 +654,36 @@ def capture_background_exception(
     )
 
 
+def capture_auth_email_alert(
+    *,
+    kind: str,
+    sends_last_hour: int,
+    sends_last_day: int,
+    distinct_ips_last_hour: int,
+) -> bool:
+    """Capture a sign-up/sign-in email spike or global-cap alert as a warning."""
+    if not is_error_monitoring_active():
+        return False
+
+    context = {
+        "fingerprint": ["auth_email_alert", kind],
+        "request": {
+            "sends_last_hour": sends_last_hour,
+            "sends_last_day": sends_last_day,
+            "distinct_ips_last_hour": distinct_ips_last_hour,
+        },
+        "tags": {"event_kind": "auth_email_alert", "alert_kind": kind},
+    }
+    _capture_with_scope(
+        context=context,
+        capture=lambda: sentry_sdk.capture_message(
+            f"Auth email alert: {kind}",
+            level="warning",
+        ),
+    )
+    return True
+
+
 def capture_commercial_fulfillment_mismatch(
     *,
     stripe_checkout_session_id: str,

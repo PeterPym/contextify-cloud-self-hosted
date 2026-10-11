@@ -45,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
 from contextify_cloud.database import get_db
-from contextify_cloud.http_security import is_secure_request
+from contextify_cloud.http_security import is_secure_request, resolve_client_ip
 from contextify_cloud.middleware.auth import generate_api_key, hash_api_key
 from contextify_cloud.middleware.jwt_auth import JWT_COOKIE_NAME
 from contextify_cloud.middleware.public_csrf import (
@@ -72,6 +72,9 @@ from contextify_cloud.services.attribution import (
     attribution_to_metadata,
 )
 from contextify_cloud.services.audit import log_event
+from contextify_cloud.services.auth_email_limits import (
+    check_auth_email_request,
+)
 from contextify_cloud.services.browser_auth import (
     BrowserAuthError,
     FinalizeResult,
@@ -480,12 +483,8 @@ def _account_status_label(account: Account | None) -> str:
 
 
 def _client_ip(request: Request) -> str | None:
-    """Best-effort client IP extraction respecting the trusted-proxy setup."""
-    forwarded = request.headers.get("x-forwarded-for")
-    peer_ip = request.client.host if request.client else None
-    if peer_ip in {"127.0.0.1", "::1"} and forwarded:
-        return forwarded.split(",", 1)[0].strip() or peer_ip
-    return peer_ip
+    """Real client IP behind the trusted reverse proxy (see resolve_client_ip)."""
+    return resolve_client_ip(request)
 
 
 def _email_link_url(raw_token: str) -> str:
@@ -609,6 +608,15 @@ async def email_init(
             status_code=429,
         )
 
+    # Caps across addresses and device codes (per client IP, global), checked
+    # before the account branch so the outcome never depends on the address.
+    email_decision = check_auth_email_request(client_ip, normalized, endpoint="email-init")
+    if email_decision.limit is not None:
+        return _no_store_json(
+            {"error": "rate_limited", "message": email_decision.limit.message},
+            status_code=429,
+        )
+
     # Account lookup runs on EVERY branch (existing-active, new-signup,
     # disabled) — see ct-1512 Shard C C2 ``timing-strategy=equivalent-DB-work``
     # comment below.
@@ -624,7 +632,12 @@ async def email_init(
         "resend_available_in": settings.auth_email_resend_cooldown_seconds,
     }
 
-    if account_status == "disabled":
+    # Past the global cap, sign-up mail to a new address is paused. It takes the
+    # disabled branch's sentinel path so the response and later OTP checks are
+    # identical to a real issuance (no account-existence signal).
+    if email_decision.new_address_paused and account_status == "new_signup":
+        account_status = "paused"
+    if account_status in ("disabled", "paused"):
         # Silent-skip: a *real* sentinel AuthToken row is issued (ct-1512
         # Shard C-fix2 C-1) so verify-otp behaves byte-identically to a
         # real-issuance branch — same response shape, same OTP attempt
@@ -646,14 +659,16 @@ async def email_init(
             hash_ip_for_logs(client_ip),
         )
         logger.info(
-            "event=device_flow_error error_code=silent_skip_disabled "
+            "event=device_flow_error error_code=silent_skip_%s "
             "endpoint=email-init email_hash=%s",
+            account_status,
             hash_email_for_logs(normalized),
         )
         sentinel = await issue_sentinel_email_token(
             db,
             purpose="device_login_existing_user",
             email_display=email_input,
+            email_normalized=normalized,
             device_authorization=device_authorization,
         )
         await db.commit()

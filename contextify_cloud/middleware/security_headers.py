@@ -12,6 +12,8 @@ from typing import Any
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from contextify_cloud.services.turnstile import TURNSTILE_ORIGIN, turnstile_active_for
+
 logger = logging.getLogger(__name__)
 
 # Non-CSP security headers (static, same for every response)
@@ -32,19 +34,25 @@ def _is_token_bearing_cloud_path(path: str) -> bool:
     )
 
 
-def _build_csp(nonce: str, browser_events_origin: str = "") -> str:
+def _build_csp(nonce: str, browser_events_origin: str = "", turnstile: bool = False) -> str:
     """Build a Content-Security-Policy with a per-request nonce.
 
     The nonce allows the theme bootstrap <script> in <head> to run
     without ``unsafe-inline``.  All other scripts are served as
-    external files from 'self'.
+    external files from 'self'. ``turnstile`` allows the Cloudflare
+    Turnstile script, its iframe and its requests (sign-up page only).
     """
     external = f" {browser_events_origin}" if browser_events_origin else ""
-    connect_src = f"connect-src 'self'{external}; " if external else ""
+    challenge = f" {TURNSTILE_ORIGIN}" if turnstile else ""
+    connect_src = (
+        f"connect-src 'self'{external}{challenge}; " if external or challenge else ""
+    )
+    frame_src = f"frame-src{challenge}; " if challenge else ""
     return (
         "default-src 'self'; "
-        f"script-src 'self' 'nonce-{nonce}'{external}; "
+        f"script-src 'self' 'nonce-{nonce}'{external}{challenge}; "
         f"{connect_src}"
+        f"{frame_src}"
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "font-src 'self'; "
@@ -90,6 +98,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response.headers["Content-Security-Policy"] = _build_csp(
                 request.state.csp_nonce,
                 browser_events_origin,
+                turnstile=turnstile_active_for(request),
             )
             for name, value in _STATIC_SECURITY_HEADERS.items():
                 response.headers[name] = value

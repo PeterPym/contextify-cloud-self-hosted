@@ -12,6 +12,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
+from contextify_cloud.http_security import resolve_client_ip
 from contextify_cloud.middleware.auth import AuthContext
 from contextify_cloud.middleware.jwt_auth import create_browser_session_token
 from contextify_cloud.models import (
@@ -65,11 +66,8 @@ def _hash_user_agent(user_agent: str | None) -> str | None:
 
 
 def _client_ip(request: Request) -> str | None:
-    forwarded = request.headers.get("x-forwarded-for")
-    peer_ip = request.client.host if request.client else None
-    if peer_ip in {"127.0.0.1", "::1"} and forwarded:
-        return forwarded.split(",", 1)[0].strip() or peer_ip
-    return peer_ip
+    """Real client IP behind the trusted reverse proxy (see resolve_client_ip)."""
+    return resolve_client_ip(request)
 
 
 def _handoff_base_url() -> str:

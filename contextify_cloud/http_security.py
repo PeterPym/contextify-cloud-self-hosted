@@ -50,6 +50,63 @@ def _is_trusted_proxy_peer(client_host: str) -> bool:
     )
 
 
+def _valid_ip(value: str | None) -> str | None:
+    """Return the candidate if it is a valid IP address, else None."""
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _rightmost_forwarded_for(value: str | None) -> str | None:
+    """Return the genuine rightmost X-Forwarded-For hop, if it is a valid IP.
+
+    The rightmost entry is the hop the trusted proxy appended (the real
+    client). The leftmost is client-supplied and spoofable, so it is never
+    used here. Crucially, we take ONLY the last non-empty token and validate
+    IT: we do not scan further left for the first valid token. If an attacker
+    seeds a valid-looking IP to the left and the genuine rightmost hop is
+    garbage, this returns None so the caller falls back to the peer IP rather
+    than trusting the attacker's value.
+    """
+    if not value:
+        return None
+    tokens = [token.strip() for token in value.split(",")]
+    non_empty = [token for token in tokens if token]
+    if not non_empty:
+        return None
+    return _valid_ip(non_empty[-1])
+
+
+def resolve_client_ip(request: Request) -> str:
+    """Resolve the real client IP behind the trusted reverse proxy.
+
+    Trust is the shared config-driven check (loopback plus any CIDR in
+    settings.trusted_proxy_cidrs). In production nginx reaches the API through
+    a published Docker port, so the peer is the bridge gateway, not loopback;
+    TRUSTED_PROXY_CIDRS covers it. For untrusted (direct) peers, forwarding
+    headers are ignored so a client cannot choose its own IP. For trusted
+    peers, the client comes from X-Real-IP, then the rightmost X-Forwarded-For
+    hop, falling back to the peer IP. Never raises and never returns "".
+    """
+    peer_ip = request.client.host if request.client else "unknown"
+    if not _is_trusted_proxy_peer(peer_ip):
+        return peer_ip
+    real_ip = _valid_ip(request.headers.get("x-real-ip"))
+    if real_ip is not None:
+        return real_ip
+    forwarded = _rightmost_forwarded_for(request.headers.get("x-forwarded-for"))
+    if forwarded is not None:
+        return forwarded
+    return peer_ip
+
+
 def is_transport_https(request: Request) -> bool:
     """Return whether the request reached the public edge over HTTPS.
 

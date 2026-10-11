@@ -18,6 +18,7 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from contextify_cloud.config import settings
+from contextify_cloud.http_security import resolve_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class AuthRateLimitMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
 
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = resolve_client_ip(request)
         now = time.monotonic()
         window = 60.0  # 1-minute sliding window
 

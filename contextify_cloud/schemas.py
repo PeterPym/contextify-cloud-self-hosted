@@ -1127,6 +1127,11 @@ class LoginEmailLinkRequest(BaseModel):
 
     email: str = Field(..., max_length=320)
     return_to: str | None = Field(default=None, max_length=512)
+    # Scripted-submission checks (services/form_shield.py); the login page's
+    # script copies these from the rendered form.
+    form_token: str | None = Field(default=None, max_length=512)
+    form_js: str | None = Field(default=None, max_length=1024)
+    website: str | None = Field(default=None, max_length=512)
 
 
 class LoginEmailLinkResponse(BaseModel):

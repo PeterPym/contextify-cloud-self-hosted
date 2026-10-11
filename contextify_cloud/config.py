@@ -137,6 +137,16 @@ class Settings(BaseSettings):
     github_repo_access_token: str = ""
     enable_docs: bool = False  # Set True locally to enable /api/docs, /api/redoc, /openapi.json
     enable_registration: bool = False  # Public self-serve registration is off by default
+    # Scripted-submission checks on the public forms that send email
+    # (services/form_shield.py): signed render token, minimum human time,
+    # JavaScript proof, honeypot. On everywhere; no external dependency.
+    form_shield_enabled: bool = True
+    form_shield_min_seconds: float = 2.0
+    # Cloudflare Turnstile human check on POST /cloud/register (services/turnstile.py).
+    # Off by default and for self-hosted installs; hosted sets all three.
+    turnstile_enabled: bool = False
+    turnstile_site_key: str = ""
+    turnstile_secret_key: str = ""
     # Hosted browser analytics is enabled by default. CI/E2E disables it so a
     # localhost browser never contacts the production first-party event relay.
     browser_analytics_enabled: bool = True
@@ -242,6 +252,18 @@ class Settings(BaseSettings):
     # unknown-sentinel, and disabled emails are suppressed identically
     # (enumeration-safe). 60s matches the client resend countdown; 0 disables.
     magic_link_send_cooldown_seconds: int = 60
+    # Caps on sign-up/sign-in email requests (services/auth_email_limits.py). The
+    # per-email cooldown above cannot stop a client that rotates proxies and
+    # addresses. Per IP: 429. Global: emails to new addresses pause, sign-in to
+    # existing accounts continues. Legitimate volume is a few
+    # a day. 0 disables.
+    auth_email_send_cap_per_ip_per_hour: int = 5
+    auth_email_send_cap_global_per_hour: int = 20
+    auth_email_send_cap_global_per_day: int = 50
+    # Operator alert (email + Sentry warning, at most hourly) once this many
+    # email requests plus rejected scripted submissions arrive within an hour.
+    # 0 disables.
+    auth_email_spike_alert_per_hour: int = 10
 
     # Magic-link / OTP device flow (cloud-magic-link spec §5.3, §10).
     # AuthToken expiry for device-flow magic-link / OTP tokens is 10 minutes.
@@ -282,6 +304,22 @@ class Settings(BaseSettings):
             data.pop("error_monitoring_smoke_test_token", None)
             data.pop("ERROR_MONITORING_SMOKE_TEST_TOKEN", None)
         return data
+
+    @field_validator("form_shield_min_seconds")
+    @classmethod
+    def validate_form_shield_min_seconds(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("FORM_SHIELD_MIN_SECONDS must be >= 0")
+        return value
+
+    @model_validator(mode="after")
+    def turnstile_requires_keys(self) -> "Settings":
+        """Refuse TURNSTILE_ENABLED without keys rather than silently skip the check."""
+        if self.turnstile_enabled and not (self.turnstile_site_key and self.turnstile_secret_key):
+            raise ValueError(
+                "TURNSTILE_ENABLED=true requires TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY"
+            )
+        return self
 
     @field_validator("sentry_traces_sample_rate", "sentry_profiles_sample_rate", mode="before")
     @classmethod
@@ -336,6 +374,10 @@ class Settings(BaseSettings):
         "rate_limit_unauth_forgot_password_per_minute",
         "rate_limit_unauth_checkout_per_minute",
         "rate_limit_telemetry_per_minute",
+        "auth_email_send_cap_per_ip_per_hour",
+        "auth_email_send_cap_global_per_hour",
+        "auth_email_send_cap_global_per_day",
+        "auth_email_spike_alert_per_hour",
     )
     @classmethod
     def validate_non_negative_rate_limits(cls, value: int) -> int:

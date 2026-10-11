@@ -610,6 +610,10 @@ def _device_authorization_id_from_token(token: AuthToken) -> uuid.UUID | None:
         return None
 
 
+# Purposes the outbox delivers and retries (see _send_auth_token_by_purpose).
+_OUTBOX_PURPOSES: tuple[str, ...] = ("password_reset", "email_verify", "email_change")
+
+
 async def _send_auth_token_by_purpose(token: AuthToken, raw_token: str) -> bool:
     if token.purpose == "password_reset":
         # Branch subject + body on whether the account has never set a
@@ -651,6 +655,10 @@ async def run_auth_email_outbox_once(*, batch_limit: int = 50) -> AuthEmailOutbo
                 .where(
                     AuthToken.consumed_at.is_(None),
                     AuthToken.expires_at > now,
+                    # Only the purposes _send_auth_token_by_purpose can send. A
+                    # failed sign-in/sign-up link is not retried; the person
+                    # resends, which issues a new token.
+                    AuthToken.purpose.in_(_OUTBOX_PURPOSES),
                     AuthToken.delivery_status.in_(("pending", "failed")),
                     AuthToken.delivery_attempts < settings.auth_email_delivery_max_attempts,
                     or_(

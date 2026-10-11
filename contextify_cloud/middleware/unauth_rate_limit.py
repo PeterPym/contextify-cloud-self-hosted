@@ -9,7 +9,6 @@ Suitable for single-instance deployments. For multi-instance production,
 replace with Redis-backed rate limiting.
 """
 
-import ipaddress
 import logging
 import math
 import time
@@ -21,7 +20,11 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from contextify_cloud.config import settings
-from contextify_cloud.http_security import _is_trusted_proxy_peer
+from contextify_cloud.http_security import (
+    _rightmost_forwarded_for as _shared_rightmost_forwarded_for,
+)
+from contextify_cloud.http_security import _valid_ip as _shared_valid_ip
+from contextify_cloud.http_security import resolve_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -103,65 +106,15 @@ _last_prune_time: float = 0.0
 WINDOW_SECONDS = 60.0  # 1-minute sliding window
 
 
-def _valid_ip(value: str | None) -> str | None:
-    """Return the candidate if it is a valid IP address, else None."""
-    if not value:
-        return None
-    candidate = value.strip()
-    if not candidate:
-        return None
-    try:
-        ipaddress.ip_address(candidate)
-    except ValueError:
-        return None
-    return candidate
-
-
-def _rightmost_forwarded_for(value: str | None) -> str | None:
-    """Return the genuine rightmost X-Forwarded-For hop, if it is a valid IP.
-
-    The rightmost entry is the hop the trusted proxy appended (the real
-    client). The leftmost is client-supplied and spoofable, so it is never
-    used here. Crucially, we take ONLY the last non-empty token and validate
-    IT: we do not scan further left for the first valid token. If an attacker
-    seeds a valid-looking IP to the left and the genuine rightmost hop is
-    garbage, this returns None so the caller falls back to the peer IP rather
-    than trusting the attacker's value.
-    """
-    if not value:
-        return None
-    # Drop trailing empty/whitespace-only tokens, then take the last remaining.
-    tokens = [token.strip() for token in value.split(",")]
-    non_empty = [token for token in tokens if token]
-    if not non_empty:
-        return None
-    return _valid_ip(non_empty[-1])
+# The client-IP resolution is shared with the browser auth flows; these names
+# stay importable here for existing callers and tests.
+_valid_ip = _shared_valid_ip
+_rightmost_forwarded_for = _shared_rightmost_forwarded_for
 
 
 def _get_client_ip(request: Request) -> str:
-    """Resolve the client IP used for per-IP rate-limit bucketing.
-
-    Trust is determined by the shared config-driven check
-    (loopback always trusted plus any CIDR in settings.trusted_proxy_cidrs).
-    For untrusted (direct) peers, forwarding headers are ignored so an
-    attacker cannot mint fresh buckets. For trusted proxy peers, the real
-    client is resolved from X-Real-IP, then the rightmost X-Forwarded-For hop,
-    falling back to the peer IP. Never raises and never returns "".
-    """
-    peer_ip = request.client.host if request.client else "unknown"
-
-    if not _is_trusted_proxy_peer(peer_ip):
-        # Direct attacker: ignore forwarding headers entirely (spoof-safety).
-        return peer_ip
-
-    # Trusted proxy: prefer X-Real-IP, else rightmost X-Forwarded-For hop.
-    real_ip = _valid_ip(request.headers.get("x-real-ip"))
-    if real_ip is not None:
-        return real_ip
-    forwarded = _rightmost_forwarded_for(request.headers.get("x-forwarded-for"))
-    if forwarded is not None:
-        return forwarded
-    return peer_ip
+    """Resolve the client IP used for per-IP rate-limit bucketing."""
+    return resolve_client_ip(request)
 
 
 def _match_endpoint(method: str, path: str) -> tuple[str, int] | None:

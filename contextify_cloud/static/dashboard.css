@@ -1125,3 +1125,14 @@ a:hover {
     border-bottom-color: var(--bg-muted);
   }
 }
+
+/* Form-shield honeypot (templates/cloud/_form_shield.html): off-screen, not
+   display:none, so naive bots still see and fill it. */
+.ctxf-hp {
+  position: absolute;
+  left: -10000px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}

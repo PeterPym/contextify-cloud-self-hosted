@@ -202,6 +202,32 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
         raise RuntimeError(str(exc)) from exc
 
 
+async def _reclaim_sentinel_accounts_once() -> None:
+    """Reclaim idle per-subject sentinel accounts; never raises."""
+    from contextify_cloud import monitoring
+    from contextify_cloud.database import async_session_factory
+    from contextify_cloud.services.device_email_flow import reclaim_idle_sentinel_accounts
+
+    try:
+        deleted = 0
+        # Bounded batches, each in its own transaction, so a large backlog
+        # never holds one long lock; anything left waits for the next sweep.
+        for _ in range(20):
+            async with async_session_factory() as session:
+                batch = await reclaim_idle_sentinel_accounts(session)
+                await session.commit()
+            deleted += batch
+            if batch == 0:
+                break
+        if deleted:
+            logger.info("event=sentinel_state_reclaimed deleted=%d", deleted)
+    except Exception as exc:
+        logger.error("Sentinel account reclamation failed", exc_info=True)
+        monitoring.capture_background_exception(
+            exc, job="sentinel_reclaim", phase="scheduled"
+        )
+
+
 async def _purge_scheduler_loop() -> None:
     """Periodic purge sweep. Runs immediately on startup, then on interval."""
     from contextify_cloud import monitoring
@@ -223,8 +249,10 @@ async def _purge_scheduler_loop() -> None:
         # under the production app_factory.lifespan.
         monitoring.capture_background_exception(exc, job="purge_scheduler", phase="startup")
 
+    await _reclaim_sentinel_accounts_once()
     while True:
         await asyncio.sleep(settings.purge_check_interval_seconds)
+        await _reclaim_sentinel_accounts_once()
         try:
             result = await run_purge_once()
             if result.purged > 0 or result.errors:

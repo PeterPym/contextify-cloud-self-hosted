@@ -29,12 +29,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
-from contextify_cloud.models import Account, AuthToken, DeviceAuthorization
+from contextify_cloud.models import Account, AuthToken, DeviceAuthorization, QARun
 from contextify_cloud.services.browser_auth import (
     _emit_device_flow_email_init,
     _raw_token_for_auth_token,
@@ -287,8 +287,11 @@ async def get_or_create_sentinel_account(
     else:
         target_email = _SENTINEL_PER_SUBJECT_EMAIL_TEMPLATE.format(key=subject_key)
 
+    # FOR UPDATE: the idle-sentinel reclaim skips locked rows, so it cannot
+    # delete this account between here and the token insert. If the reclaim
+    # locked it first, this waits, finds it gone, and creates a fresh one.
     result = await db.execute(
-        select(Account).where(Account.email_normalized == target_email)
+        select(Account).where(Account.email_normalized == target_email).with_for_update()
     )
     account = result.scalar_one_or_none()
     if account is not None:
@@ -321,6 +324,78 @@ async def get_or_create_sentinel_account(
     return sentinel
 
 
+# A per-subject sentinel account is reclaimed once none of its tokens has been
+# live within this long. It is recreated on demand (get-or-create above).
+SENTINEL_RECLAIM_AFTER = timedelta(days=1)
+SENTINEL_RECLAIM_BATCH = 5000
+_SENTINEL_PER_SUBJECT_PREFIX = _SENTINEL_PER_SUBJECT_EMAIL_TEMPLATE.split("{key}", 1)[0]
+_SENTINEL_PER_SUBJECT_SUFFIX = _SENTINEL_PER_SUBJECT_EMAIL_TEMPLATE.split("{key}", 1)[1]
+
+
+async def reclaim_idle_sentinel_accounts(
+    db: AsyncSession, *, now: datetime | None = None, batch: int = SENTINEL_RECLAIM_BATCH
+) -> int:
+    """Delete idle sentinel state, at most ``batch`` rows of each kind per call.
+
+    Every unknown-address sign-in and every paused new-address sign-up gets a
+    per-subject sentinel account (and token), and device-flow sentinels add
+    tokens to the shared sentinel account, so its OTP answers like a real
+    issuance. Without reclamation a script submitting fresh addresses grows
+    these tables without bound. Two deletes:
+
+    * per-subject sentinel accounts with no token live in the last day (their
+      tokens go with them, ON DELETE CASCADE); an account anything else
+      references is never deleted;
+    * the shared sentinel account's tokens that expired over a day ago (rows
+      from before device sentinels were scoped per device authorization); the
+      account stays.
+
+    Returns the number of rows deleted; the caller commits and calls again
+    while a full batch came back.
+    """
+    cutoff = (now or datetime.now(UTC)) - SENTINEL_RECLAIM_AFTER
+    live_token = exists().where(
+        AuthToken.account_id == Account.id, AuthToken.expires_at > cutoff
+    )
+    qa_run = exists().where(QARun.account_id == Account.id)
+    idle_accounts = (
+        select(Account.id)
+        .where(
+            func.starts_with(Account.email_normalized, _SENTINEL_PER_SUBJECT_PREFIX),
+            Account.email_normalized.endswith(_SENTINEL_PER_SUBJECT_SUFFIX, autoescape=True),
+            Account.status == "disabled",
+            ~live_token,
+            ~qa_run,
+        )
+        .limit(batch)
+        # Skip an account an issuance holds (get_or_create_sentinel_account
+        # locks it until its new token commits).
+        .with_for_update(skip_locked=True)
+        .scalar_subquery()
+    )
+    accounts = await db.execute(
+        delete(Account)
+        .where(Account.id.in_(idle_accounts))
+        .execution_options(synchronize_session=False)
+    )
+    expired_shared_tokens = (
+        select(AuthToken.id)
+        .join(Account, AuthToken.account_id == Account.id)
+        .where(
+            Account.email_normalized == _SENTINEL_ACCOUNT_EMAIL,
+            AuthToken.expires_at <= cutoff,
+        )
+        .limit(batch)
+        .scalar_subquery()
+    )
+    tokens = await db.execute(
+        delete(AuthToken)
+        .where(AuthToken.id.in_(expired_shared_tokens))
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(accounts, "rowcount", 0) or 0) + int(getattr(tokens, "rowcount", 0) or 0)
+
+
 async def issue_sentinel_email_token(
     db: AsyncSession,
     *,
@@ -343,7 +418,8 @@ async def issue_sentinel_email_token(
         against a real value.
       * ``otp_failed_attempts=0`` initially; the standard attempt counter
         + 5-attempt lockout machinery applies on every wrong OTP.
-      * ``account_id`` set to the singleton sentinel account so the
+      * ``account_id`` set to a per-subject sentinel account (keyed on the
+        probe email, or on the device authorization) so the
         ``ck_auth_token_account_id_purpose_pairing`` check constraint is
         satisfied for ``login_magic_link`` / ``device_login_existing_user``
         without a schema migration.
@@ -384,16 +460,25 @@ async def issue_sentinel_email_token(
     # the prior probe's sentinel via the singleton-account scope, and
     # that cross-token consumption is itself an enumeration oracle
     # (round-2 review finding).
-    subject_key: str | None = None
-    if device_authorization is None:
-        if email_normalized is None:
-            raise ValueError(
-                "login-flow sentinel issuance requires email_normalized "
-                "for per-subject account scoping",
-            )
-        subject_key = _sentinel_subject_key(
-            purpose=purpose, email_normalized=email_normalized,
+    #
+    # Device-flow sentinels are scoped per probe email the same way, so they
+    # behave like a real account's device tokens: one active token per
+    # (subject, purpose), superseded by the next request for that email from
+    # any device code. They once shared the singleton account, and a second
+    # device code's sentinel collided on the unique index with a 500 a real
+    # issuance never returns.
+    if email_normalized is None:
+        raise ValueError(
+            "sentinel issuance requires email_normalized for per-subject account scoping",
         )
+    subject_key: str | None = _sentinel_subject_key(
+        purpose=purpose, email_normalized=email_normalized,
+    )
+    # Serialize per probe email, like a real issuance (issue_device_email_token
+    # takes the same lock), so concurrent requests from different device codes
+    # cannot both skip supersession and collide on the unique index. Advisory
+    # locks are re-entrant, so callers that already hold it are unaffected.
+    await lock_magic_link_issue_for_email(db, email_normalized=email_normalized)
 
     sentinel_account = await get_or_create_sentinel_account(
         db, subject_key=subject_key,
@@ -423,13 +508,18 @@ async def issue_sentinel_email_token(
     # per-subject account makes this scope per-probe-email by construction.
     now = datetime.now(UTC)
     if device_authorization is not None:
+        # Same supersession as a real device token: this device's prior token,
+        # and this subject's prior token from any device.
         await db.execute(
             update(AuthToken)
             .where(
                 AuthToken.purpose == purpose,
                 AuthToken.consumed_at.is_(None),
-                AuthToken.metadata_json["device_authorization_id"].astext
-                == str(device_authorization.id),
+                or_(
+                    AuthToken.metadata_json["device_authorization_id"].astext
+                    == str(device_authorization.id),
+                    AuthToken.account_id == sentinel_account.id,
+                ),
             )
             .values(consumed_at=now)
         )
@@ -552,16 +642,28 @@ async def issue_device_email_token(
             return None
         token, raw_token = issued
     else:
-        # LOGIN branch: per-device invalidation — replace any prior unconsumed
-        # token for *this same device_authorization_id* (ct-1512 finding B4).
+        # LOGIN branch: replace any prior unconsumed token for *this same
+        # device_authorization_id* (ct-1512 finding B4), and this account's
+        # prior token from another device code: the unique index allows one
+        # active token per (account, purpose), so a second code for the same
+        # account used to fail the insert with a 500. Sentinels supersede the
+        # same way (issue_sentinel_email_token).
+        if account is None:
+            raise ValueError("device login tokens require an account")
+        # Serialize per address so concurrent requests from different device
+        # codes cannot both skip supersession and collide on the unique index.
+        await lock_magic_link_issue_for_email(db, email_normalized=account.email_normalized)
         now = datetime.now(UTC)
         await db.execute(
             update(AuthToken)
             .where(
                 AuthToken.purpose == purpose,
                 AuthToken.consumed_at.is_(None),
-                AuthToken.metadata_json["device_authorization_id"].astext
-                == str(device_authorization.id),
+                or_(
+                    AuthToken.metadata_json["device_authorization_id"].astext
+                    == str(device_authorization.id),
+                    AuthToken.account_id == account.id,
+                ),
             )
             .values(consumed_at=now)
         )
