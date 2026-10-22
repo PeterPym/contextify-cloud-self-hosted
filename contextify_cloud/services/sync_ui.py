@@ -5,6 +5,7 @@ metrics for display on the /cloud/sync page.
 """
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -13,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from contextify_cloud.config import settings
 from contextify_cloud.middleware.auth import AuthContext
-from contextify_cloud.models import Device, SyncSession
+from contextify_cloud.models import Device, SyncSession, User
+from contextify_cloud.services.device_identity import has_identity_state, short_ids
 from contextify_cloud.services.sync_status import (
     RECENT_ACTIVITY_WINDOW,
     STALL_WINDOW,
@@ -40,6 +42,18 @@ class DeviceStatus:
     created_at: datetime
     health: str  # "healthy", "recently_active", "syncing", "stalled", "inactive", "never_synced"
     last_sync_ago: str  # Human-readable "2 hours ago", "never"
+    short_id: str = ""
+    merged_into: str | None = None
+    merge_revision: int = 0
+    merge_request_id: str = ""
+    included_devices: str = ""
+    retired_at: datetime | None = None
+    removed_at: datetime | None = None
+    lifecycle_revision: int = 0
+    lifecycle_request_id: str = ""
+    standalone: bool = False
+    can_unlink: bool = False
+
 
 
 @dataclass
@@ -47,6 +61,7 @@ class ActiveSessionInfo:
     """Active push session progress."""
 
     sync_session_id: str
+    device_id: str | None
     phase: str  # "initial_upload", "stalled"
     completed_batches: int
     total_batches: int | None
@@ -116,25 +131,33 @@ def _device_health(
     now: datetime,
     active_session: ActiveSessionInfo | None,
     current_user_id: str,
+    unknown_activity: bool = False,
 ) -> str:
     """Determine device health status."""
-    if device.last_sync_at is None:
-        return "never_synced"
-
-    age = now - device.last_sync_at
-    # Only apply session state to devices owned by the session's user
+    if device.retired_at or device.removed_at:
+        return "retired"
+    # Upload health is independent of a recent status/pull renewal.
+    age = now - device.last_sync_at if device.last_sync_at else timedelta.max
     session_applies = (
-        active_session is not None and str(device.user_id) == current_user_id
+        active_session is not None
+        and str(device.user_id) == current_user_id
+        and device.machine_id == active_session.device_id
     )
     if (
-        session_applies
-        and active_session is not None
-        and active_session.is_stalled
+        session_applies and active_session is not None and active_session.is_stalled
         and age < timedelta(hours=1)
     ):
         return "stalled"
     if session_applies and age < timedelta(minutes=10):
         return "syncing"
+    if device.last_seen_at is None:
+        return "unknown"
+    if now - device.last_seen_at < timedelta(minutes=10):
+        return "recently_active"
+    if unknown_activity:
+        return "unknown"
+    if device.last_sync_at is None:
+        return "never_synced"
     if age < RECENT_ACTIVITY_WINDOW:
         return "recently_active"
     # Healthy: synced within the last hour
@@ -155,7 +178,6 @@ async def get_sync_overview(
 
     # -- Devices (owners/admins see all tenant devices, members see own) --
     if auth.has_full_access:
-        from contextify_cloud.models import User
         tenant_user_ids = select(User.id).where(User.tenant_id == auth.tenant_id)
         devices_result = await db.execute(
             select(Device).where(Device.user_id.in_(tenant_user_ids))
@@ -281,6 +303,7 @@ async def get_sync_overview(
 
             active_session = ActiveSessionInfo(
                 sync_session_id=str(latest.id),
+                device_id=latest.device_id,
                 phase="stalled" if is_stalled else "initial_upload",
                 completed_batches=latest.completed_batches,
                 total_batches=latest.total_batches,
@@ -294,20 +317,52 @@ async def get_sync_overview(
     except Exception:
         pass  # Table may not exist yet
 
+    activity_users = (await db.execute(
+        select(User).where(User.id.in_({d.user_id for d in devices}))
+    )).scalars().all() if devices else []
+    unknown_users = {
+        u.id for u in activity_users
+        if (u.last_unattributed_sync_at and
+            now - u.last_unattributed_sync_at < timedelta(minutes=10))
+        or now - u.identity_observation_started_at < timedelta(minutes=10)
+    }
+    suffixes = short_ids(list(devices))
+    by_id = {d.id: d for d in devices}
     device_statuses = [
         DeviceStatus(
             id=str(d.id),
+            can_unlink=not has_identity_state(d)
+            and not any(x.merged_into_device_id == d.id for x in devices),
+            retired_at=d.retired_at,
+            removed_at=d.removed_at,
+            lifecycle_revision=d.lifecycle_revision or 0,
+            lifecycle_request_id=str(uuid.uuid4()),
+            standalone=(d.merged_into_device_id not in by_id
+                        or bool(by_id[d.merged_into_device_id].retired_at)
+                        or bool(by_id[d.merged_into_device_id].removed_at)),
             user_id=str(d.user_id),
-            machine_name=d.machine_name,
+            machine_name=d.display_name or d.machine_name,
             machine_id=d.machine_id,
             os=d.os,
             app_version=d.app_version,
             last_sync_at=d.last_sync_at,
             created_at=d.created_at,
-            health=_device_health(d, now, active_session, str(auth.user_id)),
+            health=_device_health(
+                d, now, active_session, str(auth.user_id),
+                unknown_activity=d.user_id in unknown_users,
+            ),
             last_sync_ago=_time_ago(d.last_sync_at, now),
+            short_id=suffixes[d.machine_id],
+            merged_into=(by_id[d.merged_into_device_id].machine_id
+                         if d.merged_into_device_id in by_id else None),
+            merge_revision=d.merge_revision or 0,
+            merge_request_id=str(uuid.uuid4()),
+            included_devices=", ".join(
+                f"{x.display_name or x.machine_name} · {suffixes[x.machine_id]}"
+                for x in devices if x.merged_into_device_id == d.id
+            ),
         )
-        for d in devices
+        for d in devices if d.removed_at is None
     ]
 
     return SyncOverview(

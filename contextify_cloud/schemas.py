@@ -12,6 +12,8 @@ from pydantic import (
     model_validator,
 )
 
+from contextify_cloud.device_schemas import IdentityProof, RenameDevice
+
 
 class QARunCreateRequest(BaseModel):
     run_id: uuid.UUID
@@ -43,7 +45,6 @@ class QAResidueResponse(BaseModel):
     run_id: uuid.UUID
     state: Literal["present", "absent", "teardown_failed"]
     residue: dict[str, int]
-
 
 # --- Auth ---
 
@@ -92,7 +93,14 @@ class BrowserHandoffResponse(BaseModel):
 # --- Sync ---
 
 
-class DeviceInfo(BaseModel):
+class DeviceInfo(IdentityProof):
+    display_name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_display_name(self) -> "DeviceInfo":
+        self.display_name = RenameDevice(display_name=self.display_name).display_name
+        return self
+
     machine_id: str
     machine_name: str
     os: str | None = None
@@ -316,6 +324,12 @@ class SyncItemError(BaseModel):
 
 
 class SyncPushResponse(BaseModel):
+    device_identity_version: int = 1
+    device_lifecycle_version: int = 1
+    retirement_coverage_version: int = 1
+    lifecycle_rejection: Literal["DEVICE_WRITE_DISABLED"] | None = None
+    device_identity_action: str | None = None
+    device_identity_code: str | None = None
     accepted: int
     duplicates_skipped: int
     errors: list[str] = Field(default_factory=list)
@@ -367,10 +381,22 @@ class ActivePushSessionStatus(BaseModel):
     last_batch_at: datetime | None = None
 
 
+class StatusDeviceInfo(DeviceInfo):
+    last_seen_at: datetime | None = None
+    last_sync_at: datetime | None = None
+    lifecycle_revision: int = 0
+    retired_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
 class SyncStatusResponse(BaseModel):
+    machine_group_capabilities: dict[str, object] | None = None
+    device_identity_version: int = 1
+    device_lifecycle_version: int = 1
+    retirement_coverage_version: int = 1
     last_sync: datetime | None = None
     entries_synced: int = 0
-    devices: list[DeviceInfo] = Field(default_factory=list)
+    devices: list[StatusDeviceInfo] = Field(default_factory=list)
     server_sequence: int = 0
     pending_batches: int = 0  # Count of in-progress sync sessions
     active_push_session: ActivePushSessionStatus | None = None

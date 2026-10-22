@@ -37,6 +37,7 @@ def redact_api_key_secrets(text: str) -> str:
     Example: ctx_abcdef0123456789_111122223333444455556666
           -> ctx_abcdef0123456789_[REDACTED]
     """
+    text = re.sub(r"ctxg_([0-9a-f]{32})_[0-9a-f]{64}", r"ctxg_\1_[REDACTED]", text)
     return _API_KEY_PATTERN.sub(r"ctx_\1_[REDACTED]", text)
 
 

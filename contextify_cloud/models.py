@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -241,6 +242,10 @@ class User(Base):
     role: Mapped[str] = mapped_column(Text, nullable=False, default="member")
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_unattributed_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    identity_observation_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     consent_given_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -477,6 +482,32 @@ class Device(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
+
+    display_name: Mapped[str | None] = mapped_column(Text)
+    hardware_fingerprint_hash: Mapped[str | None] = mapped_column(Text)
+    fingerprint_kind: Mapped[str | None] = mapped_column(Text)
+    identity_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    legacy_writes_fenced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    merged_into_device_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("devices.id", ondelete="RESTRICT")
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    identity_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    identity_last_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    identity_last_request_kind: Mapped[str | None] = mapped_column(Text)
+    identity_last_payload_hash: Mapped[str | None] = mapped_column(Text)
+    merge_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    merge_last_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    merge_last_request_kind: Mapped[str | None] = mapped_column(Text)
+    merge_last_payload_hash: Mapped[str | None] = mapped_column(Text)
+    lifecycle_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    lifecycle_last_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lifecycle_last_request_kind: Mapped[str | None] = mapped_column(Text)
+    lifecycle_last_payload_hash: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped["User"] = relationship(back_populates="devices")
 
@@ -1143,3 +1174,75 @@ class LicenseRetrievalToken(Base):
         Index("idx_license_retrieval_tokens_email", text("lower(email_normalized)")),
         Index("idx_license_retrieval_tokens_expires", "expires_at"),
     )
+
+
+class MachineGroup(Base):
+    __tablename__ = "machine_groups"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    visibility: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_name: Mapped[str] = mapped_column(Text, nullable=False)
+    project_selector: Mapped[dict[str, str] | None] = mapped_column(JSONB(none_as_null=True))
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("visibility IN ('private', 'team')", name="ck_machine_group_visibility"),
+        Index("uq_machine_group_private", "owner_user_id", "normalized_name", unique=True,
+              postgresql_where=text("visibility = 'private'")),
+        Index("uq_machine_group_team", "tenant_id", "normalized_name", unique=True,
+              postgresql_where=text("visibility = 'team'")),
+    )
+
+
+class MachineGroupDevice(Base):
+    __tablename__ = "machine_group_devices"
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("machine_groups.id", ondelete="CASCADE"), primary_key=True)
+    device_record_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint("state IN ('active', 'retired')", name="ck_machine_group_device_state"),
+        Index("idx_machine_group_device", "device_record_id"),
+    )
+
+
+class MachineGroupJoinToken(Base):
+    __tablename__ = "machine_group_join_tokens"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("machine_groups.id", ondelete="CASCADE"), nullable=False)
+    issuer_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    create_request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    secret_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_uses: Mapped[int] = mapped_column(Integer, nullable=False)
+    uses: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    delivery_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("group_id", "issuer_user_id", "create_request_id",
+                         name="uq_machine_group_token_request"),
+        CheckConstraint("max_uses BETWEEN 1 AND 100 AND uses BETWEEN 0 AND max_uses",
+                        name="ck_machine_group_token_uses"),
+    )
+
+
+class MachineGroupTokenRedemption(Base):
+    __tablename__ = "machine_group_token_redemptions"
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("machine_group_join_tokens.id", ondelete="CASCADE"),
+        primary_key=True)
+    device_record_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True)
+    redeemed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now())

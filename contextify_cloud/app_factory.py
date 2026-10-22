@@ -577,10 +577,20 @@ def _install_exception_handlers(app: FastAPI) -> None:
     error (vs warning for request-side) and let FastAPI's default
     behavior (HTTP 500) stand.
     """
+    from fastapi.exception_handlers import http_exception_handler
     from fastapi.exceptions import RequestValidationError, ResponseValidationError
     from fastapi.responses import JSONResponse
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    from starlette.responses import Response
 
     from contextify_cloud import monitoring as _monitoring
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _on_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        if request.url.path.startswith("/api/v1/machine-groups"):
+            from contextify_cloud.routers.machine_groups import error_response
+            return error_response(request, exc.detail, exc.status_code, dict(exc.headers or {}))
+        return await http_exception_handler(request, exc)
 
     @app.exception_handler(RequestValidationError)
     async def _on_request_validation(
@@ -596,6 +606,9 @@ def _install_exception_handlers(app: FastAPI) -> None:
             first_type=str(first.get("type", "")),
             error_count=len(sanitized),
         )
+        if request.url.path.startswith("/api/v1/machine-groups"):
+            from contextify_cloud.routers.machine_groups import error_response
+            return error_response(request, sanitized, 422)
         return JSONResponse(status_code=422, content={"detail": sanitized})
 
     @app.exception_handler(ResponseValidationError)
@@ -666,6 +679,12 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(device_auth.router)
     app.include_router(device_auth.cloud_device_router)
     app.include_router(account.router)
+    from contextify_cloud.routers import devices
+
+    app.include_router(devices.router)
+    from contextify_cloud.routers import machine_groups
+
+    app.include_router(machine_groups.router)
     app.include_router(sync.router)
     app.include_router(search.router)
     app.include_router(projects.router)

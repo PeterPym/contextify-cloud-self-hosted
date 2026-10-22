@@ -1,3 +1,60 @@
+{% macro device_controls(device) %}
+              <div id="device-error-{{ device.id }}" role="alert" aria-live="polite"></div>
+              {% if device.can_unlink and auth.role in ['owner', 'admin'] %}
+              <button class="btn btn-outline-danger btn-sm" type="button"
+                      data-device-mutation hx-delete="/cloud/sync/devices/{{ device.id }}"
+                      hx-target="#device-error-{{ device.id }}" hx-swap="innerHTML"
+                      hx-confirm="Unlink {{ device.machine_name }}? The device will re-register on its next sync.">Unlink</button>
+              {% endif %}
+              {% if device.retired_at and (auth.role in ['owner', 'admin'] or device.user_id == auth.user_id|string) %}
+              {% for operation, label, question, explanation in [
+                ('reactivate', 'Return to Service', 'Return ' ~ device.machine_name ~ ' to service?', 'This device can sync again. Start Contextify on that machine to continue. Sync, then choose Retry skipped entries if Cloud settings shows skipped entries.'),
+                ('remove', 'Remove from List', 'Remove ' ~ device.machine_name ~ ' from this list?', 'Its history stays searchable. This device stays retired.')
+              ] %}
+              <form hx-post="/cloud/sync/devices/{{ device.machine_id|urlencode }}/{{ operation }}" data-device-mutation hx-target="#device-error-{{ device.id }}" hx-swap="innerHTML" hx-confirm="{{ question }} {{ explanation }}">
+                <input type="hidden" name="owner_user_id" value="{{ device.user_id }}">
+                <input type="hidden" name="request_id" value="{{ device.lifecycle_request_id }}">
+                <input type="hidden" name="expected_lifecycle_revision" value="{{ device.lifecycle_revision }}">
+                <input type="hidden" name="expected_retired_at" value="{{ device.retired_at.isoformat() }}">
+                <button id="device-{{ operation }}-{{ device.id }}" data-testid="device-{{ operation }}" aria-label="{{ label }}: {{ device.machine_name }} · {{ device.short_id }}" class="btn btn-outline-secondary btn-sm" type="submit">{{ label }}</button>
+              </form>
+              {% endfor %}
+              {% endif %}
+              {% if device.user_id == auth.user_id|string %}
+              <details>
+                <summary>Rename device</summary>
+                <form hx-post="/cloud/sync/devices/{{ device.machine_id|urlencode }}/rename" data-device-mutation hx-target="#device-error-{{ device.id }}" hx-swap="innerHTML">
+                  <label for="device-name-{{ device.id }}">Display name</label>
+                  <p class="small">Use a name that helps you recognize this device.</p>
+                  <input id="device-name-{{ device.id }}" class="form-control form-control-sm" name="display_name" value="{{ device.machine_name }}" maxlength="80" required>
+                  <button class="btn btn-primary btn-sm mt-1" type="submit">Save Name</button>
+                  <button class="btn btn-secondary btn-sm mt-1" type="submit" name="automatic" value="1" formnovalidate>Use Automatic Name</button>
+                </form>
+              </details>
+              {% if not device.included_devices %}
+              <details>
+                <summary>{{ 'Undo Merge' if device.merged_into else 'Merge Devices…' }}</summary>
+                <p class="small">Show these devices together. Each message keeps its original device. You can undo this merge.</p>
+                <form hx-post="/cloud/sync/devices/{{ device.machine_id|urlencode }}/merge" data-device-mutation hx-target="#device-error-{{ device.id }}" hx-swap="innerHTML" hx-confirm="{{ 'Show this device separately again?' if device.merged_into else 'Merge these device views?' }}">
+                  <input type="hidden" name="request_id" value="{{ device.merge_request_id }}">
+                  <input type="hidden" name="expected_merge_revision" value="{{ device.merge_revision }}">
+                  {% if device.merged_into %}
+                  <input type="hidden" name="into_device_id" value="{{ device.merged_into }}">
+                  <input type="hidden" name="undo" value="1">
+                  {% else %}
+                  <label for="merge-target-{{ device.id }}">Merge {{ device.machine_id }} into</label>
+                  <select id="merge-target-{{ device.id }}" name="into_device_id" class="form-select form-select-sm" required>
+                    {% for target in overview.devices if target.user_id == device.user_id and target.id != device.id and not target.merged_into %}
+                    <option value="{{ target.machine_id }}">{{ target.machine_name }} · {{ target.machine_id }}</option>
+                    {% endfor %}
+                  </select>
+                  {% endif %}
+                  <button class="btn btn-secondary btn-sm mt-1" type="submit">{{ 'Undo Merge' if device.merged_into else 'Merge Devices' }}</button>
+                </form>
+              </details>
+              {% endif %}
+              {% endif %}
+{% endmacro %}
 <!-- htmx partial: sync status content (polled every 30s during active sync) -->
 
 <!-- Out-of-band update: keep the page header badge in sync -->
@@ -105,7 +162,7 @@
   <div class="col-sm-6 col-lg-3 mb-3">
     <div class="card ctxf-card h-100">
       <div class="card-body text-center">
-        <div class="ctxf-stat-value">{{ overview.devices|length }}</div>
+        <div class="ctxf-stat-value">{{ overview.devices|rejectattr("retired_at")|list|length }}</div>
         <div class="ctxf-stat-label">Devices</div>
       </div>
     </div>
@@ -129,12 +186,13 @@
 </div>
 
 <!-- Devices -->
+{% set retired_devices = overview.devices|selectattr('retired_at')|list %}
 <div class="card ctxf-card mb-4">
   <div class="card-body">
     <h5 class="card-title mb-3">
       <i class="bi bi-laptop me-2"></i>Devices
     </h5>
-    {% if overview.devices %}
+    {% if overview.devices|rejectattr("retired_at")|list %}
     <div class="table-responsive">
       <table class="table table-sm ctxf-devices-table mb-0">
         <thead>
@@ -145,19 +203,30 @@
             <th>App Version</th>
             <th>Last Sync</th>
             <th>Registered</th>
-            {% if auth is defined and auth.role in ['owner', 'admin'] %}
+            {% if auth is defined and auth.role in ['owner', 'admin', 'member'] %}
             <th>Actions</th>
             {% endif %}
           </tr>
         </thead>
         <tbody>
-          {% for device in overview.devices %}
-          <tr id="device-row-{{ device.id }}">
+          {% for device in overview.devices if not device.retired_at and (not device.merged_into or device.standalone) %}
+          <tr id="device-row-{{ device.id }}" tabindex="-1" data-testid="device-row-{{ device.id }}">
             <td>
               <div class="d-flex align-items-center gap-2">
                 <i class="bi bi-display text-secondary"></i>
                 <span class="fw-medium">{{ device.machine_name }}</span>
+                <small class="text-secondary" title="Device ID: {{ device.machine_id }}">· {{ device.short_id }}</small>
               </div>
+              {% if device.included_devices %}
+              <details>
+                <summary class="small text-secondary">Includes {{ device.included_devices }}</summary>
+                {% for alias in overview.devices if alias.merged_into == device.machine_id and alias.user_id == device.user_id and not alias.retired_at %}
+                  <p>{{ alias.machine_name }} · {{ alias.machine_id }} — {{ alias.health }}</p>
+                  {{ device_controls(alias) }}
+                {% endfor %}
+              </details>
+              {% endif %}
+              {% if device.merged_into %}<small class="d-block text-secondary">Merged into {{ device.merged_into }}; still syncing independently</small>{% endif %}
             </td>
             <td>
               {% if device.health == "syncing" %}
@@ -180,6 +249,8 @@
               <span class="badge ctxf-device-badge-inactive">
                 <i class="bi bi-moon me-1"></i>Inactive
               </span>
+              {% elif device.health == "unknown" %}
+              <span class="badge ctxf-device-badge-inactive">Activity unknown</span>
               {% else %}
               <span class="badge ctxf-device-badge-never">
                 <i class="bi bi-dash-circle me-1"></i>Never synced
@@ -190,16 +261,9 @@
             <td class="text-secondary">{{ device.app_version or '--' }}</td>
             <td class="text-secondary">{{ device.last_sync_ago }}</td>
             <td class="text-secondary">{{ device.created_at.strftime('%b %d, %Y') }}</td>
-            {% if auth is defined and auth.role in ['owner', 'admin'] %}
+            {% if auth is defined and auth.role in ['owner', 'admin', 'member'] %}
             <td>
-              <button class="btn btn-outline-danger btn-sm"
-                      hx-delete="/cloud/sync/devices/{{ device.id }}"
-                      hx-target="#device-row-{{ device.id }}"
-                      hx-swap="outerHTML"
-                      hx-confirm="Unlink {{ device.machine_name }}? The device will re-register on its next sync."
-                      title="Unlink device">
-                <i class="bi bi-x-lg"></i>
-              </button>
+              {{ device_controls(device) }}
             </td>
             {% endif %}
           </tr>
@@ -211,12 +275,25 @@
     <div class="text-center py-4">
       <i class="bi bi-laptop fs-3 text-secondary d-block mb-2"></i>
       <p class="text-secondary mb-0">
-        No devices registered yet. Connect the Contextify app to start syncing.
+        {% if retired_devices %}No active devices. Return a retired device to service or connect a new device.{% else %}No devices registered yet. Connect the Contextify app to start syncing.{% endif %}
       </p>
     </div>
     {% endif %}
   </div>
 </div>
+
+<details id="retired-devices" class="card ctxf-card mb-4 p-3">
+  <summary data-testid="devices-show-retired">Show retired devices ({{ retired_devices|length }})</summary>
+  <p>History stays searchable. To recover skipped uploads: Return to Service, sync, then Retry skipped entries in Contextify.</p>
+  {% for device in retired_devices %}
+  <div id="device-row-{{ device.id }}" tabindex="-1" data-testid="device-row-{{ device.id }}" class="py-2">
+    <strong>{{ device.machine_name }}</strong> <span data-testid="device-id">· {{ device.short_id }}</span>
+    <span class="badge text-bg-secondary" data-testid="device-state">Retired</span>
+    <p class="small">Retired {{ device.retired_at.strftime('%b %d, %Y') }}</p>
+    {{ device_controls(device) }}
+  </div>
+  {% endfor %}
+</details>
 
 <!-- Sync Details -->
 <div class="card ctxf-card">

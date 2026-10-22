@@ -123,6 +123,12 @@ async def resolve_api_key(
     api_key: Annotated[str | None, Security(api_key_header)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AuthContext:
+    return await verify_credential(request, api_key, db, record_usage=True)
+
+
+async def verify_credential(
+    request: Request, api_key: str | None, db: AsyncSession, *, record_usage: bool,
+) -> AuthContext:
     """Validate an API key and return the auth context.
 
     This is a FastAPI dependency used on protected endpoints.
@@ -191,12 +197,11 @@ async def resolve_api_key(
             detail="API key has expired.",
         )
 
-    # Update last_used_at
-    await db.execute(
-        update(ApiKey)
-        .where(ApiKey.id == candidate.id)
-        .values(last_used_at=datetime.now(UTC))
-    )
+    if record_usage:
+        await db.execute(
+            update(ApiKey).where(ApiKey.id == candidate.id)
+            .values(last_used_at=datetime.now(UTC))
+        )
 
     # Fetch user role for data scoping.
     # Fail closed: if the user record is missing, reject the request rather

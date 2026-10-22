@@ -12,6 +12,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi import Request as HttpRequest
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -25,11 +26,11 @@ from contextify_cloud.middleware.endpoint_rate_limit import require_sync_rate_li
 from contextify_cloud.models import Device, SyncIdempotency, SyncSession, Tenant, UsageEvent, User
 from contextify_cloud.schemas import (
     ActivePushSessionStatus,
-    DeviceInfo,
     PullEntry,
     PullProject,
     PullSummary,
     PullTranscript,
+    StatusDeviceInfo,
     SyncEntry,
     SyncItemError,
     SyncPullResponse,
@@ -37,6 +38,7 @@ from contextify_cloud.schemas import (
     SyncPushResponse,
     SyncStatusResponse,
 )
+from contextify_cloud.services import device_identity
 from contextify_cloud.services.attribution import with_tenant_acquisition_properties
 from contextify_cloud.services.audit import log_event
 from contextify_cloud.services.funnel_events import emit_funnel_event, funnel_backend_registered
@@ -44,10 +46,16 @@ from contextify_cloud.services.operator_notifications import notify_first_activa
 from contextify_cloud.services.plan_limits import (
     RETENTION_BATCH_SIZE,
     get_effective_history_retention_days,
-    get_plan_limits,
     is_unlimited,
 )
 from contextify_cloud.services.repo_grouping import canonical_repo_group_key, normalize_repo_origin
+from contextify_cloud.services.retirement_coverage import (
+    CoverageRequest,
+    CoverageResponse,
+)
+from contextify_cloud.services.retirement_coverage import (
+    coverage as retirement_coverage,
+)
 from contextify_cloud.services.sync_status import (
     STALL_WINDOW,
     finalize_effectively_complete_sessions,
@@ -168,8 +176,15 @@ def _compute_request_sha256(request: SyncPushRequest) -> str:
     Uses a canonical JSON representation of the data-bearing fields (excludes
     idempotency_key itself and batch_seq from the hash).
     """
+    device_payload = request.device.model_dump(mode="json")
+    # Preserve pre-043 hashes for unchanged legacy bodies, including explicit
+    # nulls. Meaningful new proof/name fields still bind the request hash.
+    for name in ("identity_instance_id", "hardware_fingerprint_hash",
+                 "fingerprint_kind", "display_name"):
+        if device_payload.get(name) is None:
+            device_payload.pop(name, None)
     canonical = {
-        "device": request.device.model_dump(mode="json"),
+        "device": device_payload,
         "projects": [_jsonable(p) for p in request.projects],
         "transcripts": [_jsonable(t) for t in request.transcripts],
         "entries": [_jsonable(e) for e in request.entries],
@@ -333,7 +348,7 @@ async def sync_push(
     request: SyncPushRequest,
     auth: Annotated[AuthContext, Depends(require_sync_rate_limit)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> SyncPushResponse:
+) -> SyncPushResponse | JSONResponse:
     """Push entries from local database to cloud.
 
     Requires sync scope and owner/admin/member role. Viewers cannot push data.
@@ -577,7 +592,6 @@ async def sync_push(
     if not tenant_obj:
         raise HTTPException(status_code=404, detail="Tenant not found.")
 
-    plan_limits = get_plan_limits(tenant_obj)
     schema = get_tenant_schema(tenant_obj.slug)
     await ensure_tenant_schema_compat(db, schema)
     if not _SCHEMA_NAME_RE.match(schema):
@@ -593,92 +607,84 @@ async def sync_push(
     entries_retriable_failed = 0
     entries_blocked_policy = 0
 
-    # Register/update device
-    device_result = await db.execute(
-        select(Device).where(
-            Device.user_id == auth.user_id,
-            Device.machine_id == request.device.machine_id,
-        )
-    )
-    device = device_result.scalar_one_or_none()
-    # ct-2106: track whether THIS device's last_sync_at was NULL before this
-    # request (a NULL->non-NULL first-sync transition). The UPDATEs below are raw
-    # SQL and do NOT mutate the loaded ORM object, so device.last_sync_at still
-    # holds the PRE-update value; capture the boolean BEFORE issuing each UPDATE.
-    device_was_first_sync = False
-    if device:
-        device_was_first_sync = device.last_sync_at is None
-        await db.execute(
-            update(Device)
-            .where(Device.id == device.id)
-            .values(
-                machine_name=request.device.machine_name,
-                os=request.device.os,
-                app_version=request.device.app_version,
-                last_sync_at=datetime.now(UTC),
-            )
-        )
-    else:
-        device_limit = plan_limits.max_devices_per_user
-        if device_limit is not None:
-            # Lock the user row to serialize concurrent new-device registrations
+    # Identity guards run before any tenant content or sync-session write.
+    device = await device_identity.register_device(db, auth, tenant_obj, request.device)
+    device_was_first_sync = device.last_sync_at is None
+    now = datetime.now(UTC)
+    refusal = device_identity.write_refusal(device, request.device, now)
+    if refusal:
+        server_sequence = (
             await db.execute(
-                select(User.id)
-                .where(
-                    User.id == auth.user_id,
-                    User.tenant_id == auth.tenant_id,
+                text(f"SELECT COALESCE(MAX(server_sequence), 0) FROM {schema}.transcript_entries")
+            )
+        ).scalar() or 0
+        # Undo the idempotency reservation too. This refusal must be reevaluated
+        # after recovery, never cached even with completed_with_issues. No session
+        # batch is consumed. 1.7.x checks safety before quarantine; 1.8.x after it.
+        await db.rollback()
+        if request.device.identity_instance_id is None:
+            reason = (
+                "This device is retired in Contextify Cloud. Return it to service "
+                "on the web Sync page to sync again."
+                if refusal == "DEVICE_RETIRED"
+                else "This device identity was continued on another installation. "
+                "Keep this library and set up a separate device to sync here."
+            )
+            items = [
+                SyncItemError(
+                    item_kind="entry", index=index, item_id=entry.get("id"),
+                    error_code="ENTRY_INVALID_FIELD", retryable=False, detail=reason,
                 )
-                .with_for_update()
+                for index, entry in enumerate(request.entries)
+            ]
+            count = len(items)
+            response = SyncPushResponse(
+                accepted=0, duplicates_skipped=0,
+                errors=[f"Entry {item.item_id}: {reason}" for item in items[:10]]
+                if items else [f"Device: {reason}"],
+                idempotency_key=request.idempotency_key,
+                sync_session_id=request.sync_session_id, batch_seq=request.batch_seq,
+                server_sequence=server_sequence,
+                entries_sent=count, entries_permanent_failed=count, entries_resolved=count,
+                needs_attention_count=count, checkpoint_safe=False,
+                completion_state="completed_with_issues", item_errors=items,
+                error_codes=["ENTRY_INVALID_FIELD"] if items else [],
+                lifecycle_rejection="DEVICE_WRITE_DISABLED",
+                device_identity_code=refusal,
+                device_identity_action="reactivate" if refusal == "DEVICE_RETIRED" else "adopt",
             )
-            # Re-check after lock: another request may have created the device
-            device_recheck = await db.execute(
-                select(Device).where(
-                    Device.user_id == auth.user_id,
-                    Device.machine_id == request.device.machine_id,
-                )
-            )
-            device = device_recheck.scalar_one_or_none()
-        if device is None and device_limit is not None:
-            device_count_result = await db.execute(
-                select(func.count(Device.id)).where(Device.user_id == auth.user_id)
-            )
-            device_count = device_count_result.scalar() or 0
-            if device_count >= device_limit:
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"Device limit reached ({device_limit}/{device_limit}) for the "
-                        f"{tenant_obj.plan} plan. Remove an old device or upgrade at "
-                        "hosted billing."
-                    ),
-                )
-        if device is not None:
-            # Device was created by a concurrent request after our initial check
-            # ct-2106: capture the pre-update first-sync transition here too.
-            device_was_first_sync = device.last_sync_at is None
-            await db.execute(
-                update(Device)
-                .where(Device.id == device.id)
-                .values(
-                    machine_name=request.device.machine_name,
-                    os=request.device.os,
-                    app_version=request.device.app_version,
-                    last_sync_at=datetime.now(UTC),
-                )
-            )
-        else:
-            # ct-2106: a brand-new device's first sync is always a first-sync.
-            device_was_first_sync = True
-            device = Device(
-                user_id=auth.user_id,
-                machine_name=request.device.machine_name,
-                machine_id=request.device.machine_id,
-                os=request.device.os,
-                app_version=request.device.app_version,
-                last_sync_at=datetime.now(UTC),
-            )
-            db.add(device)
-            await db.flush()
+            # Only this N=0 wire shape omits the code list: released clients use
+            # errorCodes ?? errors for display. The normal response model would
+            # reinsert its [] default and hide the human reason.
+            return JSONResponse(response.model_dump(
+                mode="json", exclude={"error_codes"} if not items else set(),
+            ))
+        if refusal == "DEVICE_RETIRED":
+            raise HTTPException(409, detail={
+                "code": "DEVICE_RETIRED",
+                "message": "Return this device to service on the web Sync page to sync again.",
+            })
+        return SyncPushResponse(
+            accepted=0, duplicates_skipped=0,
+            errors=[
+                "Device identity needs attention. Stop the previous installation "
+                "and use device adopt or set up a new device."
+            ],
+            idempotency_key=request.idempotency_key,
+            sync_session_id=request.sync_session_id, batch_seq=request.batch_seq,
+            server_sequence=server_sequence,
+            entries_sent=len(request.entries), entries_retriable_failed=len(request.entries),
+            entries_resolved=0, checkpoint_safe=False, completion_state="blocked",
+            needs_attention_count=len(request.entries), error_codes=[refusal],
+            device_identity_code=refusal,
+            device_identity_action="reidentify" if refusal == "DEVICE_ID_CONFLICT" else "adopt",
+        )
+    device_identity.bind_proof(device, request.device)
+    await db.execute(update(Device).where(Device.id == device.id).values(
+        machine_name=device.machine_name if device.display_name else request.device.machine_name,
+        os=request.device.os, app_version=request.device.app_version,
+        last_sync_at=now, last_seen_at=now,
+    ))
 
     # ── Sync session tracking (validate existing session) ────────────
     # If the client provided a sync_session_id, validate it belongs to this
@@ -1898,12 +1904,19 @@ async def sync_pull(
     since: Annotated[int, Query(ge=0, description="server_sequence cursor")] = 0,
     limit: Annotated[int, Query(ge=1, le=1000, description="max entries per response")] = 200,
     project_id: Annotated[str | None, Query(description="optional project filter")] = None,
+    machine_id: str | None = None,
+    identity_instance_id: uuid.UUID | None = None,
+    identity_setup: bool = False,
+    device_id: str | None = None,
 ) -> SyncPullResponse:
     """Pull entries from cloud, using cursor-based pagination via server_sequence.
 
     Returns entries with server_sequence > since, ordered by server_sequence ASC.
     Includes referenced projects, transcripts, and summaries for the returned entries.
     """
+    await device_identity.record_read_activity(
+        db, auth, machine_id, identity_instance_id, identity_setup
+    )
     # Resolve tenant schema
     tenant = await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
     tenant_obj = tenant.scalar_one_or_none()
@@ -1941,6 +1954,14 @@ async def sync_pull(
     if project_id:
         project_clause = "AND project_id = :project_id"
         pull_params["project_id"] = project_id
+
+    if device_id is not None:
+        pull_params["device_ids"] = await device_identity.read_device_set(db, auth, device_id)
+        pull_params["device_owner_id"] = str(auth.user_id)
+        project_clause += (
+            " AND uploaded_by_device_id = ANY(:device_ids)"
+            " AND uploaded_by_user_id = :device_owner_id"
+        )
 
     entries_result = await db.execute(
         text(
@@ -2123,9 +2144,15 @@ async def sync_pull(
 async def sync_status(
     auth: Annotated[AuthContext, Depends(require_scope("sync"))],
     db: Annotated[AsyncSession, Depends(get_db)],
+    machine_id: str | None = None,
+    identity_instance_id: uuid.UUID | None = None,
+    identity_setup: bool = False,
 ) -> SyncStatusResponse:
     """Get sync status for the authenticated user."""
     now = datetime.now(UTC)
+    await device_identity.record_read_activity(
+        db, auth, machine_id, identity_instance_id, identity_setup
+    )
     # Get devices
     devices_result = await db.execute(select(Device).where(Device.user_id == auth.user_id))
     devices = devices_result.scalars().all()
@@ -2269,19 +2296,36 @@ async def sync_status(
     except Exception:
         pass  # Table may not exist yet during migration rollout
 
+    from contextify_cloud.services.plan_limits import machine_group_capabilities
+
     return SyncStatusResponse(
+        machine_group_capabilities=machine_group_capabilities(tenant_obj),
         last_sync=last_sync,
         entries_synced=entries_synced,
         devices=[
-            DeviceInfo(
+            StatusDeviceInfo(
+                last_seen_at=d.last_seen_at,
+                last_sync_at=d.last_sync_at,
+                lifecycle_revision=d.lifecycle_revision or 0,
+                retired_at=d.retired_at,
+                removed_at=d.removed_at,
                 machine_id=d.machine_id,
-                machine_name=d.machine_name,
+                machine_name=d.display_name or d.machine_name,
                 os=d.os,
                 app_version=d.app_version,
             )
-            for d in devices
+            for d in devices if d.retired_at is None and d.removed_at is None
         ],
         server_sequence=server_sequence,
         pending_batches=pending_batches,
         active_push_session=active_push_session,
     )
+
+
+@router.post("/coverage", response_model=CoverageResponse)
+async def sync_coverage(
+    payload: CoverageRequest,
+    auth: Annotated[AuthContext, Depends(require_sync_rate_limit)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CoverageResponse:
+    return await retirement_coverage(db, auth, payload)

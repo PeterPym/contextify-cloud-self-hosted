@@ -29,6 +29,7 @@ class PlanLimits:
     max_devices_per_user: int | None
     history_retention_days: int
     team_features: bool
+    machine_groups: str = "allowed"
 
 
 SELF_HOSTED_PERSONAL_LIMITS = PlanLimits(
@@ -54,6 +55,7 @@ _PLAN_LIMITS: dict[str, PlanLimits] = {
     SELF_HOSTED_PLAN: SELF_HOSTED_LIMITS,
     FREE_PLAN: PlanLimits(
         max_users=1,
+        machine_groups="allowed_with_upgrade_notice",
         max_devices_per_user=2,
         history_retention_days=60,
         team_features=False,
@@ -180,3 +182,23 @@ def get_effective_history_retention_days(tenant: Any) -> int:
     ]
     positive_days = [days for days in candidates if isinstance(days, int) and days > 0]
     return min(positive_days) if positive_days else 0
+
+
+def machine_group_capabilities(tenant: object) -> dict[str, object]:
+    policy = get_plan_limits(tenant).machine_groups
+    return {
+        "contract_version": 1, "machine_groups": policy,
+        "upgrade_url": settings.invitation_base_url.rstrip("/") + "hosted billing"
+        if policy == "allowed_with_upgrade_notice" else None,
+        "search_grammar": "postgresql_plain_english", "live_recall": True,
+    }
+
+
+def require_machine_group_team(tenant: object) -> None:
+    """Use existing team and commercial-license gates without Personal imports."""
+    require_team_features(tenant)
+    if profile_from_settings(settings) is CloudProfile.SELF_HOSTED_COMMERCIAL:
+        from contextify_cloud.services.commercial_license import (
+            require_commercial_self_hosted_license,
+        )
+        require_commercial_self_hosted_license()

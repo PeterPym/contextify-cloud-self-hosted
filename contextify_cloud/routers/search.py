@@ -21,6 +21,7 @@ from contextify_cloud.middleware.auth import AuthContext
 from contextify_cloud.middleware.endpoint_rate_limit import require_search_rate_limit
 from contextify_cloud.models import Tenant
 from contextify_cloud.schemas import SearchResponse, SearchResult
+from contextify_cloud.services.device_identity import read_device_set
 from contextify_cloud.services.tenant import get_tenant_schema
 from contextify_cloud.services.user_scoping import build_user_scope_clause
 
@@ -41,6 +42,7 @@ async def search(
         "shared their own entries for it (members only; requires project_id; per-contributor)",
     ),
     user_id: str | None = Query(None, description="Filter by user (admin only)"),
+    device_id: str | None = Query(None, description="Exact device ID, including merged aliases"),
     since: str | None = Query(None, description="Filter entries after this date (YYYY-MM-DD)"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -71,6 +73,12 @@ async def search(
     params: dict[str, object] = {"query": q, "limit": limit, "offset": offset}
 
     where_clauses = ["e.search_vector @@ plainto_tsquery('english', :query)"]
+
+    if device_id is not None:
+        params["device_ids"] = await read_device_set(db, auth, device_id)
+        params["device_owner_id"] = str(auth.user_id)
+        where_clauses.append("e.uploaded_by_device_id = ANY(:device_ids)")
+        where_clauses.append("e.uploaded_by_user_id = :device_owner_id")
 
     # Normalize project_id once: an empty/whitespace `?project_id=` binds as "" (not None).
     # The project WHERE fragment AND the ct-2250 team-widening gate below MUST key off the SAME

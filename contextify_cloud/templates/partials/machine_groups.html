@@ -1,0 +1,61 @@
+<section id="machine-groups" class="card mt-4" aria-labelledby="groups-heading">
+  <div class="card-body">
+    <h2 id="groups-heading" tabindex="-1">Machine groups</h2>
+    <p>Search synced history from a collection of devices. Joining never enables sync or shares projects.</p>
+    <div id="group-upgrade-notice" class="alert alert-info" hidden>
+      Machine groups are a Pro feature. <a id="group-upgrade-link">Upgrade to Pro</a>
+      <p>Cloud Free syncs two devices; upgrade to Pro for a fleet.</p>
+      <button id="group-upgrade-dismiss" class="btn btn-sm btn-outline-secondary">Dismiss</button>
+    </div>
+    <p id="group-management-disabled" hidden>Read-only viewers cannot manage groups.</p>
+    <div id="group-error" role="alert" class="text-danger"></div>
+    <div id="group-result" role="status" aria-live="polite"></div>
+    <form id="group-create" class="d-flex gap-2 flex-wrap">
+      <label>Group name <input id="group-name" name="name" class="form-control" required maxlength="80"></label>
+      <label>Visibility <select id="group-visibility" class="form-select"><option value="private">Private</option><option value="team">Team</option></select></label>
+      <label>Default Cloud project (optional)<select id="group-project" class="form-select"><option value="">All authorized projects</option></select></label>
+      <button class="btn btn-primary" type="submit">Create group</button>
+    </form>
+    <p id="group-empty" hidden>No machine groups yet. Create a group, then add your devices.</p>
+    <ul id="group-list" class="list-group mt-3"></ul>
+    <section id="group-detail" class="mt-3" hidden aria-labelledby="group-detail-heading">
+      <h3 id="group-detail-heading" tabindex="-1"></h3>
+      <p id="group-detail-description"></p>
+      <form id="group-rename" class="d-flex gap-2"><label>New group name <input id="group-new-name" required maxlength="80" class="form-control"></label><button type="submit" class="btn btn-secondary">Rename group</button></form>
+      <form id="group-device-add" class="d-flex gap-2 mt-2"><label>Device <select id="group-add-device" class="form-select"></select></label><button type="submit" class="btn btn-secondary">Add device and its synced history</button></form>
+      <p>Removing a device removes its history from this group only. It does not retire the device or revoke its key.</p>
+      <p id="group-devices-empty" hidden>No devices in this group yet</p>
+      <ul id="group-active-devices" class="list-group"></ul>
+      <button id="group-show-retired" class="btn btn-link" aria-expanded="false" aria-controls="group-retired-devices">Show retired memberships</button>
+      <div id="group-retired-section" hidden><p id="group-retired-devices-empty" hidden>No retired memberships</p></div>
+      <ul id="group-retired-devices" class="list-group" hidden></ul>
+      <p>Search includes retained retired history, including later authorized archive imports.</p>
+      <button id="group-setup-copy-owner" class="btn btn-outline-secondary">Copy owner setup command</button>
+      <button id="group-setup-copy-teammate" class="btn btn-outline-secondary">Copy teammate setup command</button>
+      <section id="group-tokens" class="mt-3">
+        <h4>Join tokens</h4>
+        <p>Teammates use their own account credentials. Tokens permit joining only.</p>
+        <form id="group-token-create" class="d-flex gap-2">
+          <label>Expires in (seconds)<input id="group-token-expiry" type="number" min="1" max="86400" value="3600" required class="form-control"></label>
+          <label>Maximum uses<input id="group-token-max-uses" type="number" min="1" max="100" value="1" required class="form-control"></label>
+          <button type="submit" class="btn btn-secondary">Issue join token</button>
+        </form>
+        <div id="group-token-delivery" hidden>
+          <p>Shown once. Copy or download now. Leaving this view clears the secret.</p>
+          <output id="group-token-secret" aria-label="One-time join token"></output>
+          <button id="group-token-copy" class="btn btn-secondary">Copy token</button>
+          <button id="group-token-download" class="btn btn-secondary">Download token</button>
+          <button id="group-token-close" class="btn btn-secondary">Hide secret</button>
+        </div>
+        <label class="d-block mt-2"><input id="group-token-inactive" type="checkbox"> Show revoked and expired tokens</label>
+        <p id="group-tokens-empty" hidden>No join tokens issued</p>
+        <ul id="group-token-list" class="list-group mt-2"></ul>
+        <nav aria-label="Join token pages" class="d-flex gap-2 mt-2">
+          <button id="group-token-previous" class="btn btn-outline-secondary" disabled>Previous tokens</button>
+          <span id="group-token-page" aria-live="polite"></span>
+          <button id="group-token-next" class="btn btn-outline-secondary" disabled>Next tokens</button>
+        </nav>
+      </section>
+    </section>
+  </div>
+</section>
