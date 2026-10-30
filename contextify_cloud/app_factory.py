@@ -19,6 +19,7 @@ from contextify_cloud.config import (
     DEFAULT_API_SECRET_KEY,
     DEFAULT_EMAIL_FROM,
     MIN_SUPPORT_ADMIN_TOKEN_LENGTH,
+    dev_email_sink_refusal,
     is_dev_email_url,
     settings,
 )
@@ -174,10 +175,23 @@ def validate_runtime_settings(profile: CloudProfile | None = None) -> None:
             "DEV_ALLOW_FAKE_TRANSACTIONAL_EMAIL is only allowed with localhost, "
             "loopback, or .test EMAIL_BASE_URL and INVITATION_BASE_URL values."
         )
+    sink_refusal = dev_email_sink_refusal(settings)
+    if (
+        sink_refusal is None
+        and settings.dev_email_sink_smtp
+        and resolved_profile is CloudProfile.HOSTED_QA
+    ):
+        sink_refusal = "DEV_EMAIL_SINK_SMTP is refused for the hosted_qa profile"
+    if sink_refusal is not None:
+        raise RuntimeError(
+            f"{sink_refusal}. The mail sink is a local/dev-only transport and "
+            "must never be configured for production or hosted QA."
+        )
     if (
         resolved_profile is CloudProfile.HOSTED
         and not settings.resend_api_key
         and not settings.dev_allow_fake_transactional_email
+        and not settings.dev_email_sink_smtp
     ):
         raise RuntimeError(
             "RESEND_API_KEY must be configured when SELF_HOSTED=false. "

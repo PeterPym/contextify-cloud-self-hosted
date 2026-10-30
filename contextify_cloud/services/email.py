@@ -2,19 +2,31 @@
 
 Resend is the production sender. When RESEND_API_KEY is not configured,
 messages are logged instead so local development and CI can validate the
-workflow without external credentials.
+workflow without external credentials. DEV_EMAIL_SINK_SMTP (ct-5331) routes
+mail to a local SMTP catcher such as Mailpit; it is refused unless the
+configuration is unmistakably local (see ``dev_email_sink_refusal``).
 """
 
+import asyncio
+import ipaddress
 import logging
+import smtplib
+import socket
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import make_msgid
 from pathlib import Path
 
 import httpx
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
-from contextify_cloud.config import is_dev_email_url, settings
+from contextify_cloud.config import (
+    dev_email_sink_refusal,
+    is_dev_email_url,
+    parse_dev_email_sink,
+    settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +83,88 @@ class TransactionalEmailResult:
     provider_message_id: str | None = None
 
 
+def _resolve_dev_email_sink(host: str, port: int) -> str:
+    """Resolve the sink host and return one address, refusing any public IP.
+
+    The connection is pinned to the checked address so a DNS answer cannot
+    redirect sink mail to a real mail server.
+    """
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    addresses = {str(info[4][0]) for info in infos}
+    if not addresses:
+        raise OSError("dev email sink host did not resolve")
+    for address in addresses:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+        if not (ip.is_loopback or ip.is_private) or ip.is_global:
+            raise OSError("dev email sink host resolves to a non-private address")
+    return sorted(addresses)[0]
+
+
+# Every sink message uses this envelope recipient and a null envelope sender.
+# The original recipient stays only in the To header, so even an SMTP server
+# that forwards mail could only deliver to an undeliverable .invalid address,
+# and the null sender means no bounce goes back to EMAIL_FROM.
+DEV_EMAIL_SINK_ENVELOPE_RECIPIENT = "captured@dev-email-sink.invalid"
+
+
+def _deliver_to_dev_email_sink(host: str, port: int, mime: EmailMessage) -> None:
+    address = _resolve_dev_email_sink(host, port)
+    with smtplib.SMTP(address, port, timeout=10) as smtp:
+        smtp.send_message(
+            mime,
+            # Null reverse-path: no bounce can be generated toward EMAIL_FROM.
+            from_addr="",
+            to_addrs=[DEV_EMAIL_SINK_ENVELOPE_RECIPIENT],
+        )
+
+
+async def _send_to_dev_email_sink(message: TransactionalEmail) -> TransactionalEmailResult:
+    """Deliver one message to the local SMTP mail sink (ct-5331, dev only).
+
+    The caller has already checked ``dev_email_sink_refusal``. The sink keeps
+    the full message so a local end-to-end run can read links and codes.
+    """
+    parsed = parse_dev_email_sink(settings.dev_email_sink_smtp)
+    if parsed is None:
+        return TransactionalEmailResult(accepted=False)
+    host, port = parsed
+    mime = EmailMessage()
+    mime["From"] = settings.email_from
+    mime["To"] = message.to_email
+    mime["Subject"] = message.subject
+    if settings.email_reply_to:
+        mime["Reply-To"] = settings.email_reply_to
+    message_id = make_msgid(domain="dev-email-sink.test")
+    mime["Message-ID"] = message_id
+    if message.idempotency_key:
+        mime["X-Idempotency-Key"] = message.idempotency_key
+    for name, value in (message.headers or {}).items():
+        mime[name] = value
+    mime.set_content(message.text)
+    if message.html:
+        mime.add_alternative(message.html, subtype="html")
+    try:
+        await asyncio.to_thread(_deliver_to_dev_email_sink, host, port, mime)
+    except (OSError, smtplib.SMTPException):
+        logger.exception("event=dev_email_sink_send_failed")
+        return TransactionalEmailResult(accepted=False)
+    logger.warning("event=dev_email_sink_delivery Email delivered to the local dev mail sink.")
+    return TransactionalEmailResult(accepted=True, provider_message_id=message_id)
+
+
 async def send_transactional_email_result(
     message: TransactionalEmail,
 ) -> TransactionalEmailResult:
     """Send one email and retain Resend's opaque acceptance identifier."""
+    if settings.dev_email_sink_smtp:
+        refusal = dev_email_sink_refusal(settings)
+        if refusal is not None:
+            logger.error(
+                "event=dev_email_sink_refused reason=%r Email not sent.", refusal
+            )
+            return TransactionalEmailResult(accepted=False)
+        return await _send_to_dev_email_sink(message)
+
     if settings.dev_allow_fake_transactional_email:
         if not settings.self_hosted and not (
             is_dev_email_url(settings.email_base_url)
@@ -624,7 +714,7 @@ async def send_invitation_email(
     subject = f"You're invited to join {tenant_name} on Contextify Cloud"
     text = _render_email_template("email/team_invitation.txt", **context)
 
-    if settings.resend_api_key:
+    if settings.resend_api_key or settings.dev_email_sink_smtp:
         html = _render_email_template("email/team_invitation.html", **context)
         return await send_transactional_email(
             TransactionalEmail(

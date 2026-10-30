@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from contextify_cloud.middleware.auth import generate_api_key, hash_api_key
 from contextify_cloud.models import ApiKey, Tenant, User
+from contextify_cloud.services.internal_accounts import is_internal_account_email
 
 logger = logging.getLogger(__name__)
 
@@ -388,7 +389,12 @@ async def provision_tenant(
     """Provision a new tenant with owner user and API key.
 
     Returns (tenant, user, raw_api_key).
+
+    Every sign-up path provisions through here, so an operator test or QA
+    address (``is_internal_account_email``) makes the tenant internal even when
+    the caller did not ask for it. The flag only ever widens to True.
     """
+    is_internal = is_internal or is_internal_account_email(email)
     # Create tenant
     tenant = Tenant(name=name, slug=_sanitize_slug(slug), is_internal=is_internal)
     db.add(tenant)

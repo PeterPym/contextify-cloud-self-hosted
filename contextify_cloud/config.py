@@ -22,6 +22,66 @@ def is_dev_email_url(value: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".test")
 
 
+def parse_dev_email_sink(value: str) -> tuple[str, int] | None:
+    """Parse ``DEV_EMAIL_SINK_SMTP`` (``host:port``); None when malformed."""
+    host, sep, port_text = value.strip().rpartition(":")
+    host = host.strip().strip("[]").rstrip(".").lower()
+    if not sep or not host or not port_text.isdigit():
+        return None
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        return None
+    return host, port
+
+
+DEV_EMAIL_SINK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "mailpit"})
+
+
+def is_local_email_sink_host(host: str) -> bool:
+    """Return True only for the controlled catcher: loopback or the compose ``mailpit``.
+
+    Any other name or literal (including single-label names that could resolve
+    publicly and numeric forms such as ``0x08080808``) is refused. The send path
+    additionally resolves the host and requires loopback or private addresses.
+    """
+    return host.strip().rstrip(".").lower() in DEV_EMAIL_SINK_HOSTS
+
+
+def dev_email_sink_refusal(settings_obj: "Settings") -> str | None:
+    """Return why ``DEV_EMAIL_SINK_SMTP`` must not be used, or None when allowed.
+
+    The sink is a local/dev-only transport (ct-5331). It is refused whenever
+    the configuration could be production: a Resend key is present, or any
+    link host is not localhost, loopback or ``.test``. Startup refuses to boot
+    and the send path refuses to deliver on the same conditions.
+    """
+    if not settings_obj.dev_email_sink_smtp.strip():
+        return None
+    parsed = parse_dev_email_sink(settings_obj.dev_email_sink_smtp)
+    if parsed is None:
+        return "DEV_EMAIL_SINK_SMTP must be host:port"
+    if not is_local_email_sink_host(parsed[0]):
+        return "DEV_EMAIL_SINK_SMTP host must be localhost, loopback or mailpit"
+    if settings_obj.cloud_profile.strip().lower() == "hosted_qa":
+        return "DEV_EMAIL_SINK_SMTP is refused for CLOUD_PROFILE=hosted_qa"
+    if settings_obj.resend_api_key:
+        return "DEV_EMAIL_SINK_SMTP cannot be combined with RESEND_API_KEY"
+    if settings_obj.dev_allow_fake_transactional_email:
+        return (
+            "DEV_EMAIL_SINK_SMTP cannot be combined with "
+            "DEV_ALLOW_FAKE_TRANSACTIONAL_EMAIL"
+        )
+    if not (
+        is_dev_email_url(settings_obj.email_base_url)
+        and is_dev_email_url(settings_obj.invitation_base_url)
+    ):
+        return (
+            "DEV_EMAIL_SINK_SMTP is only allowed with localhost, loopback, or "
+            ".test EMAIL_BASE_URL and INVITATION_BASE_URL values"
+        )
+    return None
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -47,12 +107,24 @@ class Settings(BaseSettings):
     # logged instead of sent so local/dev/CI workflows remain fully testable.
     resend_api_key: str = ""
     dev_allow_fake_transactional_email: bool = False
+    # ct-5331: local/dev-only SMTP mail sink ("host:port", e.g. a Mailpit
+    # service at "mailpit:1025"). When set, transactional email goes to the
+    # sink instead of Resend so a local stack can read welcome and magic-link
+    # mail. dev_email_sink_refusal() rejects it at startup and at send time
+    # unless the configuration is unmistakably local.
+    dev_email_sink_smtp: str = ""
     email_from: str = DEFAULT_EMAIL_FROM
     email_reply_to: str = "support@contextify.sh"
     # ct-2076: operator/ops notification recipient for signup + activation +
     # paid events. Empty disables all operator notifications (self-hosted has
     # no central operator). Managed prod sets this to the operator's address.
     operator_notification_email: str = "rob@contextify.sh"
+    # Operator test accounts: comma-separated addresses whose tenants are created
+    # internal (no funnel analytics, no operator signup/activation emails). A
+    # plus-addressed variant of a listed address also matches, so every
+    # rob+<tag>@banagale.com test signup is internal. Reserved test TLDs (.test,
+    # .invalid, ...) are always internal; see services/internal_accounts.py.
+    internal_account_emails: str = "rob@banagale.com,rob@contextify.sh"
     email_base_url: str = ""
     auth_email_delivery_max_attempts: int = 3
     auth_email_retry_delay_seconds: int = 300
