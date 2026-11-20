@@ -20,9 +20,10 @@ from contextify_cloud.schemas import (
     ProjectDetail,
     ProjectShareRequest,
     ProjectShareResponse,
+    ProjectSharesResponse,
     ProjectSummary,
 )
-from contextify_cloud.services.tenant import get_tenant_schema
+from contextify_cloud.services.tenant import ensure_tenant_schema_compat, get_tenant_schema
 from contextify_cloud.services.user_scoping import build_user_scope_clause
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,30 @@ async def _ensure_project_visible(
     )
     if not visible.first():
         raise HTTPException(status_code=404, detail="Project not found.")
+
+
+@router.get("/shares", response_model=ProjectSharesResponse)
+async def list_own_project_shares(
+    auth: Annotated[AuthContext, Depends(require_scope("sync"))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ProjectSharesResponse:
+    """ct-5461: the CALLER'S OWN team-share rows, as server project ids.
+
+    A share made from another Mac or the web is otherwise invisible to a
+    client, so its sharing-review gate could miss it. Returns only rows whose
+    user_id is the caller; never another user's shares. Declared before the
+    /{project_id} routes so "shares" is never read as a project id.
+    """
+    schema = await _resolve_schema(auth, db)
+    await ensure_tenant_schema_compat(db, schema)
+    result = await db.execute(
+        text(
+            f"SELECT project_id FROM {schema}.project_team_shares "
+            "WHERE user_id = :user_id ORDER BY project_id"
+        ),
+        {"user_id": str(auth.user_id)},
+    )
+    return ProjectSharesResponse(project_ids=[row.project_id for row in result.fetchall()])
 
 
 @router.post("/{project_id}/share", response_model=ProjectShareResponse)

@@ -62,8 +62,7 @@ MAX_TRACKED_IPS = 20_000
 _OVERFLOW_KEY = "overflow"
 
 IP_LIMITED_MESSAGE = (
-    "Too many sign-in emails were requested from your network. "
-    "Please try again in an hour."
+    "Too many sign-in emails were requested from your network. Please try again in an hour."
 )
 
 
@@ -210,21 +209,19 @@ def check_auth_email_request(
 
 
 def record_rejected_submission() -> None:
-    """Count one form-shield rejection toward the spike alert (no email sent)."""
+    """Count one form-shield rejection (no email sent) for the spike alert's report."""
     now = time.monotonic()
     _sweep(now)
     _rejected.add(now)
-    _check_spike(now)
 
 
 def _check_spike(now: float) -> None:
     threshold = settings.auth_email_spike_alert_per_hour
     if threshold <= 0:
         return
-    attempts = _requests.count_since(now, HOUR_SECONDS) + _rejected.count_since(
-        now, HOUR_SECONDS
-    )
-    if attempts >= threshold:
+    # Only real email requests count. Rejected scripted submissions sent nothing,
+    # so they are logged and shown in the alert body but never trigger it.
+    if _requests.count_since(now, HOUR_SECONDS) >= threshold:
         _maybe_alert(
             kind="spike",
             now=now,

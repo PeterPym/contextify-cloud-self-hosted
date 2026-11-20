@@ -34,7 +34,7 @@ _SCHEMA_NAME_RE = re.compile(r"^tenant_[a-z0-9_]+$")
 _ENSURED_COMPAT_SCHEMAS: set[str] = set()
 _ENSURE_COMPAT_LOCK = asyncio.Lock()
 
-_TENANT_SCHEMA_COMPAT_SQL = (
+_TENANT_SCHEMA_COMPAT_SQL: tuple[str, ...] = (
     """
     ALTER TABLE {schema}.projects
         ADD COLUMN IF NOT EXISTS repo_group_key TEXT
@@ -104,6 +104,67 @@ _TENANT_SCHEMA_COMPAT_SQL = (
         ON {schema}.transcript_tags(tag, transcript_id)
     """,
 )
+
+_REPO_EVIDENCE_COMPAT_SQL: tuple[str, ...] = (
+    # ct-5459 (Slice 3): versioned, source-qualified repository evidence.
+    # Every statement is additive and metadata-only on large tenants: new
+    # nullable columns without defaults, a new sequence, a new table and an
+    # index on that new (initially empty) table. Alembic 045 applies the same
+    # statements to every tenant before the app serves; this request-time
+    # path covers tenants created or restored afterwards.
+    """
+    ALTER TABLE {schema}.projects
+        ADD COLUMN IF NOT EXISTS lane_name TEXT
+    """,
+    # transcript_entries is the largest table. ALTER ... IF NOT EXISTS takes
+    # its ACCESS EXCLUSIVE lock even when the column exists, so only alter
+    # when the column is actually missing.
+    """
+    DO $ct5459$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = '{schema}.transcript_entries'::regclass
+              AND attname = 'source_project_id'
+              AND NOT attisdropped
+        ) THEN
+            ALTER TABLE {schema}.transcript_entries
+                ADD COLUMN IF NOT EXISTS source_project_id TEXT;
+        END IF;
+    END
+    $ct5459$
+    """,
+    """
+    CREATE SEQUENCE IF NOT EXISTS {schema}.repo_evidence_seq
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {schema}.repo_evidence (
+        source_project_id TEXT NOT NULL,
+        source_machine_id TEXT NOT NULL,
+        uploaded_by_user_id UUID NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        project_id TEXT NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+        device_id UUID,
+        key_version INTEGER,
+        origin_key TEXT,
+        common_dir_key TEXT,
+        legacy_repo_group_key TEXT,
+        lane_root TEXT,
+        checkout_root TEXT,
+        first_seq BIGINT NOT NULL,
+        last_seq BIGINT NOT NULL,
+        first_seen_at BIGINT NOT NULL,
+        last_seen_at BIGINT NOT NULL,
+        PRIMARY KEY (source_project_id, source_machine_id, uploaded_by_user_id, evidence_hash)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_repo_evidence_project
+        ON {schema}.repo_evidence(project_id)
+    """,
+)
+
+_TENANT_SCHEMA_COMPAT_SQL = _TENANT_SCHEMA_COMPAT_SQL + _REPO_EVIDENCE_COMPAT_SQL
 
 # SQL template for per-tenant schema.
 # {schema} is replaced with the sanitized tenant slug.
@@ -274,6 +335,8 @@ CREATE TABLE IF NOT EXISTS {schema}.transcript_tags (
 CREATE INDEX IF NOT EXISTS idx_transcript_tags_tag
     ON {schema}.transcript_tags(tag, transcript_id);
 """
+# New tenants get the Slice 3 objects through the same additive compat
+# statements (create_tenant_schema runs them), so the two paths cannot drift.
 
 
 def _sanitize_slug(slug: str) -> str:
@@ -318,6 +381,8 @@ async def create_tenant_schema(db: AsyncSession, slug: str) -> None:
         statement = statement.strip()
         if statement:
             await db.execute(text(statement))
+    for statement in _REPO_EVIDENCE_COMPAT_SQL:
+        await db.execute(text(statement.replace("{schema}", schema_name)))
 
     logger.info("Created tenant schema: %s", schema_name)
 

@@ -26,10 +26,14 @@ from contextify_cloud.middleware.endpoint_rate_limit import require_sync_rate_li
 from contextify_cloud.models import Device, SyncIdempotency, SyncSession, Tenant, UsageEvent, User
 from contextify_cloud.schemas import (
     ActivePushSessionStatus,
+    LaneRepoEvidence,
     PullEntry,
     PullProject,
+    PullRepoKey,
     PullSummary,
     PullTranscript,
+    RepoEvidenceRequest,
+    RepoEvidenceResponse,
     StatusDeviceInfo,
     SyncEntry,
     SyncItemError,
@@ -47,6 +51,15 @@ from contextify_cloud.services.plan_limits import (
     RETENTION_BATCH_SIZE,
     get_effective_history_retention_days,
     is_unlimited,
+)
+from contextify_cloud.services.repo_evidence import (
+    EvidenceRecord,
+    LaneKey,
+    ValidEvidence,
+    lane_evidence,
+    project_repo_info,
+    record_evidence,
+    validate_evidence,
 )
 from contextify_cloud.services.repo_grouping import canonical_repo_group_key, normalize_repo_origin
 from contextify_cloud.services.retirement_coverage import (
@@ -183,9 +196,19 @@ def _compute_request_sha256(request: SyncPushRequest) -> str:
                  "fingerprint_kind", "display_name"):
         if device_payload.get(name) is None:
             device_payload.pop(name, None)
+    projects_payload = []
+    for project in request.projects:
+        project_payload = _jsonable(project)
+        # ct-5459: keep pre-Slice-3 hashes for unchanged legacy bodies so an
+        # idempotent retry that spans the deploy still replays. Non-null
+        # values still bind the hash.
+        for name in ("lane_name", "repo_evidence"):
+            if project_payload.get(name) is None:
+                project_payload.pop(name, None)
+        projects_payload.append(project_payload)
     canonical = {
         "device": device_payload,
-        "projects": [_jsonable(p) for p in request.projects],
+        "projects": projects_payload,
         "transcripts": [_jsonable(t) for t in request.transcripts],
         "entries": [_jsonable(e) for e in request.entries],
         "summaries": [_jsonable(s) for s in request.summaries],
@@ -287,6 +310,7 @@ def _entry_insert_params(
     suffix: str,
     auth: AuthContext,
     device: Device | None,
+    source_lane: str | None = None,
 ) -> dict[str, object]:
     return {
         f"id{suffix}": entry.id,
@@ -314,6 +338,9 @@ def _entry_insert_params(
         or (device.machine_name if device else None),
         f"created_at{suffix}": entry.created_at,
         f"updated_at{suffix}": entry.updated_at,
+        # ct-5459: immutable per-entry provenance; set only when this push
+        # carried usable versioned evidence for the entry's lane.
+        f"source_project_id{suffix}": source_lane,
     }
 
 
@@ -325,7 +352,7 @@ def _entry_values_sql(suffix: str) -> str:
         f" :display_in_timeline{suffix},"
         f" :git_branch{suffix}, :git_commit{suffix}, :cwd{suffix},"
         f" :user_id{suffix}, :device_id{suffix}, :device_name{suffix},"
-        f" :created_at{suffix}, :updated_at{suffix})"
+        f" :created_at{suffix}, :updated_at{suffix}, :source_project_id{suffix})"
     )
 
 
@@ -336,7 +363,7 @@ def _insert_entries_sql(schema: str, values_sql: str) -> str:
              timestamp, content, content_sha256, display_in_timeline,
              git_branch, git_commit, cwd, uploaded_by_user_id,
              uploaded_by_device_id, uploaded_by_device_name,
-             created_at, updated_at)
+             created_at, updated_at, source_project_id)
         VALUES {values_sql}
         ON CONFLICT (id) DO NOTHING
     """
@@ -773,7 +800,10 @@ async def sync_push(
         provided_project_ids = {p.id for p in original_projects}
 
         def _proj_name(p: Any) -> str:
-            return (p.name or "").strip()
+            # ct-5459: a client that sends the repository name as `name` also
+            # sends the 1.8 lane name as `lane_name`; the allow-list keeps
+            # matching the lane name so its semantics do not change.
+            return (p.lane_name or p.name or "").strip()
 
         allowed_project_ids = {p.id for p in original_projects if _proj_name(p) in allowed_set}
 
@@ -802,7 +832,10 @@ async def sync_push(
             placeholders = ", ".join(f":pid_{i}" for i in range(len(missing_from_batch)))
             pid_params = {f"pid_{i}": pid for i, pid in enumerate(missing_from_batch)}
             existing_result = await db.execute(
-                text(f"SELECT id, name FROM {schema}.projects WHERE id IN ({placeholders})"),
+                text(
+                    f"SELECT id, COALESCE(lane_name, name) AS name "
+                    f"FROM {schema}.projects WHERE id IN ({placeholders})"
+                ),
                 pid_params,
             )
             existing_db_projects = {
@@ -859,6 +892,32 @@ async def sync_push(
                 extra,
             )
 
+    async def _record_project_evidence(
+        canonical_id: str,
+        proj: Any,
+        valid_evidence: ValidEvidence | None,
+        effective_repo_group_key: str | None,
+    ) -> None:
+        # ct-5459: one evidence tuple per (lane, pushing device, keys, roots).
+        # Runs inside the project's savepoint so evidence and row commit together.
+        await record_evidence(
+            db,
+            schema,
+            [
+                EvidenceRecord(
+                    project_id=canonical_id,
+                    source_project_id=proj.id,
+                    source_machine_id=device.machine_id if device else "",
+                    device_id=str(device.id) if device else None,
+                    user_id=str(auth.user_id),
+                    evidence=valid_evidence,
+                    legacy_repo_group_key=effective_repo_group_key,
+                    lane_root=proj.root_path,
+                )
+            ],
+            now_epoch,
+        )
+
     # Upsert projects (with repo_group_key deduplication)
     # When a client pushes a project ID that doesn't exist on the server but
     # its repo_group_key matches an existing project, the incoming ID is an
@@ -868,14 +927,28 @@ async def sync_push(
     # references in this batch accordingly.
     now_epoch = int(datetime.now(UTC).timestamp())
     project_id_remap: dict[str, str] = {}
+    # ct-5459: canonical id for every accepted project, and lanes that carried
+    # usable versioned evidence in this push (their entries get provenance).
+    project_canonical_ids: dict[str, str] = {}
+    attested_lanes: set[str] = set()
     for i, proj in enumerate(request.projects):
         sp = f"sp_proj_{i}"
         try:
             normalized_repo_origin = normalize_repo_origin(proj.repo_origin_normalized)
-            effective_repo_group_key = canonical_repo_group_key(
+            valid_evidence: ValidEvidence | None = validate_evidence(proj.repo_evidence)
+            if proj.repo_evidence is not None and valid_evidence is None:
+                error_codes.add("REPO_EVIDENCE_UNSUPPORTED")
+            legacy_repo_group_key = canonical_repo_group_key(
                 proj.repo_group_key,
                 proj.repo_identity,
                 normalized_repo_origin,
+            )
+            # ct-5459: versioned evidence decides the merge key. A common-dir
+            # key is device- and incarnation-qualified, so it never merges a
+            # new lane across devices; the legacy derivation (unqualified
+            # git-common-dir:<sha>) is only used without versioned evidence.
+            effective_repo_group_key = (
+                valid_evidence.merge_key if valid_evidence else legacy_repo_group_key
             )
             await db.execute(text(f"SAVEPOINT {sp}"))
 
@@ -905,6 +978,7 @@ async def sync_push(
                         vcs_provider = COALESCE(:vcs_provider, vcs_provider),
                         worktree_name = COALESCE(:worktree_name, worktree_name),
                         repo_name = COALESCE(:repo_name, repo_name),
+                        lane_name = COALESCE(:lane_name, lane_name),
                         updated_at = :updated_at
                     WHERE id = :id
                 """),
@@ -921,11 +995,18 @@ async def sync_push(
                         "vcs_provider": proj.vcs_provider,
                         "worktree_name": proj.worktree_name,
                         "repo_name": proj.repo_name,
+                        "lane_name": proj.lane_name,
                         "updated_at": now_epoch,
                     },
                 )
+                await _record_project_evidence(
+                    proj.id, proj, valid_evidence, effective_repo_group_key
+                )
                 await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
                 accepted += 1
+                project_canonical_ids[proj.id] = proj.id
+                if valid_evidence and device is not None:
+                    attested_lanes.add(proj.id)
                 continue
 
             # Project ID is new. Check for repo_group_key match (same logical
@@ -935,7 +1016,7 @@ async def sync_push(
                     text(
                         f"SELECT id FROM {schema}.projects "
                         f"WHERE repo_group_key = :rgk AND id != :id "
-                        f"ORDER BY created_at ASC LIMIT 1"
+                        f"ORDER BY created_at ASC, id ASC LIMIT 1"
                     ),
                     {"rgk": effective_repo_group_key, "id": proj.id},
                 )
@@ -953,7 +1034,13 @@ async def sync_push(
                     await db.execute(
                         text(f"""
                         UPDATE {schema}.projects SET
-                            name = COALESCE(:name, name),
+                            -- ct-5459: an alias that sends lane_name (and may send a
+                            -- repository name as name) never renames the canonical
+                            -- row; its allow-list name would otherwise drift.
+                            name = CASE
+                                WHEN :keep_canonical_name THEN name
+                                ELSE COALESCE(:name, name)
+                            END,
                             repo_identity = COALESCE(:repo_identity, repo_identity),
                             repo_origin_normalized = COALESCE(
                                 :repo_origin_normalized, repo_origin_normalized
@@ -973,6 +1060,7 @@ async def sync_push(
                         {
                             "canonical_id": canonical_id,
                             "name": proj.name,
+                            "keep_canonical_name": proj.lane_name is not None,
                             "repo_identity": proj.repo_identity,
                             "repo_origin_normalized": normalized_repo_origin,
                             "git_common_dir": proj.git_common_dir,
@@ -984,8 +1072,14 @@ async def sync_push(
                             "updated_at": now_epoch,
                         },
                     )
+                    await _record_project_evidence(
+                        canonical_id, proj, valid_evidence, effective_repo_group_key
+                    )
                     await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
                     accepted += 1
+                    project_canonical_ids[proj.id] = canonical_id
+                    if valid_evidence and device is not None:
+                        attested_lanes.add(proj.id)
                     continue
 
             # Genuinely new project, insert it
@@ -996,13 +1090,14 @@ async def sync_push(
                         id, name, root_path, repo_group_key, repo_identity,
                         repo_origin_normalized, git_common_dir, is_worktree,
                         default_branch, vcs_provider, worktree_name, repo_name,
-                        created_by_user_id, created_at, updated_at
+                        lane_name, created_by_user_id, created_at, updated_at
                     )
                 VALUES (
                     :id, :name, :root_path, :repo_group_key,
                     :repo_identity, :repo_origin_normalized,
                     :git_common_dir, :is_worktree, :default_branch, :vcs_provider,
-                    :worktree_name, :repo_name, :user_id, :created_at, :updated_at
+                    :worktree_name, :repo_name, :lane_name, :user_id, :created_at,
+                    :updated_at
                 )
             """),
                 {
@@ -1018,16 +1113,33 @@ async def sync_push(
                     "vcs_provider": proj.vcs_provider,
                     "worktree_name": proj.worktree_name,
                     "repo_name": proj.repo_name,
+                    "lane_name": proj.lane_name,
                     "user_id": str(auth.user_id),
                     "created_at": now_epoch,
                     "updated_at": now_epoch,
                 },
             )
+            await _record_project_evidence(proj.id, proj, valid_evidence, effective_repo_group_key)
             await db.execute(text(f"RELEASE SAVEPOINT {sp}"))
             accepted += 1
+            project_canonical_ids[proj.id] = proj.id
+            if valid_evidence and device is not None:
+                attested_lanes.add(proj.id)
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"Project {proj.id}: {e}")
+
+    # ct-5459: per-entry provenance, captured before remap. An entry is
+    # attributed to its lane only when this push attested that lane and the
+    # entry originated on the pushing device (evidence is keyed by it).
+    entry_source_lane: dict[int, str] = {}
+    if device is not None:
+        for entry in entries:
+            if entry.project_id in attested_lanes and entry.source_device_id in (
+                None,
+                device.machine_id,
+            ):
+                entry_source_lane[id(entry)] = entry.project_id
 
     # Apply project_id_remap to transcripts and entries before upserting
     if project_id_remap:
@@ -1224,7 +1336,7 @@ async def sync_push(
             try:
                 await db.execute(text(f"SAVEPOINT {sp}"))
                 # Build multi-row VALUES INSERT (sub-batch at 1000 to stay
-                # under asyncpg's 32767 parameter limit: 18 cols * 1000 = 18000)
+                # under asyncpg's 32767 parameter limit: 19 cols * 1000 = 19000)
                 entry_sub_batch = 1000
                 total_inserted = 0
                 for batch_start in range(0, len(new_entries), entry_sub_batch):
@@ -1240,6 +1352,7 @@ async def sync_push(
                                 suffix=suffix,
                                 auth=auth,
                                 device=device,
+                                source_lane=entry_source_lane.get(id(entry)),
                             )
                         )
                     values_sql = ",\n                        ".join(value_rows)
@@ -1278,6 +1391,7 @@ async def sync_push(
                                 suffix="",
                                 auth=auth,
                                 device=device,
+                                source_lane=entry_source_lane.get(id(entry)),
                             ),
                         )
                         inserted = result.rowcount  # type: ignore[attr-defined]
@@ -1710,6 +1824,7 @@ async def sync_push(
         item_errors=item_errors,
         server_sequence=server_sequence,
         project_id_remapped=project_id_remap,
+        project_canonical_ids=project_canonical_ids,
     )
 
     # Store only resolved idempotency responses for future replay. Retryable
@@ -1969,7 +2084,7 @@ async def sync_pull(
             f"timestamp, content, content_sha256, display_in_timeline, "
             f"git_branch, git_commit, cwd, uploaded_by_user_id, "
             f"uploaded_by_device_id, uploaded_by_device_name, "
-            f"server_sequence, created_at, updated_at "
+            f"server_sequence, created_at, updated_at, source_project_id "
             f"FROM {schema}.transcript_entries "
             f"WHERE server_sequence IS NOT NULL AND server_sequence > :since "
             f"{project_clause} {scope_clause} "
@@ -2010,6 +2125,7 @@ async def sync_pull(
                 uploaded_by_user_id=str(row.uploaded_by_user_id),
                 uploaded_by_device_id=row.uploaded_by_device_id,
                 uploaded_by_device_name=row.uploaded_by_device_name,
+                source_lane_id=getattr(row, "source_project_id", None),
                 server_sequence=row.server_sequence,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
@@ -2052,6 +2168,7 @@ async def sync_pull(
 
     # Fetch referenced transcripts
     transcripts: list[PullTranscript] = []
+
     if transcript_ids:
         placeholders = ", ".join(f":t{i}" for i in range(len(transcript_ids)))
         params = {f"t{i}": tid for i, tid in enumerate(transcript_ids)}
@@ -2114,6 +2231,10 @@ async def sync_pull(
     except Exception:
         pass
 
+    # ct-5459: repository evidence. Read last so it never reorders the page
+    # queries above; it shares the page's snapshot and lock.
+    page_lane_evidence = await _attach_repo_evidence(db, schema, auth, projects, entries)
+
     logger.info(
         "Sync pull: tenant=%s user=%s role=%s entries=%d skipped=%d has_more=%s since=%d",
         auth.tenant_id,
@@ -2130,6 +2251,7 @@ async def sync_pull(
         projects=projects,
         transcripts=transcripts,
         summaries=summaries,
+        lane_evidence=page_lane_evidence,
         has_more=has_more,
         next_cursor=next_cursor,
         server_sequence=current_server_sequence,
@@ -2138,6 +2260,75 @@ async def sync_pull(
     # yield teardown can otherwise keep it held behind a slow network reader.
     await db.commit()
     return response
+
+
+async def _attach_repo_evidence(
+    db: AsyncSession,
+    schema: str,
+    auth: AuthContext,
+    projects: list[PullProject],
+    entries: list[PullEntry],
+) -> list[LaneRepoEvidence]:
+    """ct-5459: Slice 3 repository fields for one pull page.
+
+    Lane evidence is derived only from the page's entries, which are already
+    user-scoped, and is keyed by each entry's own uploader.
+    """
+    lanes: list[LaneKey] = [
+        (e.source_lane_id, e.uploaded_by_device_id, e.uploaded_by_user_id)
+        for e in entries
+        if e.source_lane_id and e.uploaded_by_device_id
+    ]
+    page_lanes = await lane_evidence(db, schema, lanes) if lanes else []
+    if projects:
+        ev_scope, ev_params = build_user_scope_clause(
+            auth, column="ev.uploaded_by_user_id", param_name="ev_scope_user_id"
+        )
+        info = await project_repo_info(
+            db, schema, [p.id for p in projects], ev_scope, ev_params, str(auth.user_id)
+        )
+        for proj in projects:
+            row = info.get(proj.id)
+            if row is None:
+                continue
+            proj.repo_group_key = row["repo_group_key"]
+            proj.canonical_project_id = row["canonical_project_id"]
+            proj.repo_keys = [PullRepoKey(**k) for k in row["repo_keys"]]
+            proj.shared_by_caller = row["shared_by_caller"]
+    return page_lanes
+
+
+@router.post("/repo-evidence", response_model=RepoEvidenceResponse)
+async def sync_repo_evidence(
+    body: RepoEvidenceRequest,
+    auth: Annotated[AuthContext, Depends(require_scope("sync"))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RepoEvidenceResponse:
+    """ct-5459: current evidence for lanes whose history a client already pulled.
+
+    Pull is an entry change feed. A later push that puts a lane in conflict
+    (a remote change, or an unversioned push after a versioned one) changes
+    the verdict for entries a client already has, without producing new
+    entries. Members can only ask about their own lanes; other lanes are
+    omitted. Unknown lanes come back as ``unattested``.
+    """
+    tenant = await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
+    tenant_obj = tenant.scalar_one_or_none()
+    if not tenant_obj:
+        raise HTTPException(status_code=404, detail="Tenant not found.")
+    schema = get_tenant_schema(tenant_obj.slug)
+    if not _SCHEMA_NAME_RE.match(schema):
+        logger.error("Unsafe tenant schema name: %r", schema)
+        raise HTTPException(status_code=500, detail="Internal configuration error.")
+    await ensure_tenant_schema_compat(db, schema)
+    own = str(auth.user_id)
+    lanes: list[LaneKey] = []
+    for ref in body.lanes:
+        uploader = ref.uploaded_by_user_id or own
+        if not auth.has_full_access and uploader != own:
+            continue
+        lanes.append((ref.source_lane_id, ref.source_device_id, uploader))
+    return RepoEvidenceResponse(lanes=await lane_evidence(db, schema, lanes))
 
 
 @router.get("/status", response_model=SyncStatusResponse)

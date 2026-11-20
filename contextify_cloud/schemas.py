@@ -110,6 +110,14 @@ class DeviceInfo(IdentityProof):
 class SyncProject(BaseModel):
     id: str
     name: str | None = None
+    # ct-5459: the lane display name (what 1.8 sent as `name`). When present,
+    # the tenant project allow-list matches this instead of `name`.
+    lane_name: str | None = None
+    # ct-5459: versioned repository evidence (wire contract rev 2). Typed as
+    # Any on purpose: a malformed or unsupported object must not 422 the push.
+    # The handler validates it with services.repo_evidence.validate_evidence
+    # and falls back to legacy semantics (error code REPO_EVIDENCE_UNSUPPORTED).
+    repo_evidence: Any = None
     root_path: str
     repo_group_key: str | None = None
     repo_identity: str | None = None
@@ -363,6 +371,13 @@ class SyncPushResponse(BaseModel):
             "via repo_group_key deduplication. Key = client ID, value = canonical ID."
         ),
     )
+    project_canonical_ids: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "ct-5459: canonical server ID for every accepted project in the request, "
+            "identity mappings included. Key = client ID, value = canonical ID."
+        ),
+    )
 
 
 class ActivePushSessionStatus(BaseModel):
@@ -427,15 +442,55 @@ class PullEntry(BaseModel):
     uploaded_by_user_id: str
     uploaded_by_device_id: str | None = None
     uploaded_by_device_name: str | None = None
+    # ct-5459: the client lane this entry was pushed under, set only when that
+    # push carried usable versioned evidence for the lane; null otherwise.
+    source_lane_id: str | None = None
     server_sequence: int = Field(..., ge=1)
     created_at: int
     updated_at: int
+
+
+class PullRepoKey(BaseModel):
+    """ct-5459: one distinct versioned key seen in a project's evidence.
+
+    canonical_project_id is resolved per key: the row a new push carrying this
+    key's merge key (origin, else common dir) would merge into, or null when
+    no row holds that key any more (e.g. after a remote change). Clients map a
+    key only through this field, never through the project's own canonical id.
+    """
+
+    key_version: int
+    origin_key: str | None = None
+    common_dir_key: str | None = None
+    canonical_project_id: str | None = None
 
 
 class PullProject(BaseModel):
     id: str
     name: str | None = None
     root_path: str
+    # ct-5459 (all optional, additive). repo_group_key is suggestion-only.
+    repo_group_key: str | None = None
+    canonical_project_id: str | None = None
+    repo_keys: list[PullRepoKey] = Field(default_factory=list)
+    # ct-5461 (contract rev 4): the caller has a project_team_shares row for this id.
+    shared_by_caller: bool = False
+
+
+class LaneRepoEvidence(BaseModel):
+    """ct-5459: evidence state of one (lane, pushing device, uploader)."""
+
+    source_lane_id: str
+    source_device_id: str
+    uploaded_by_user_id: str
+    state: Literal["verified", "legacy", "unattested", "conflict"]
+    key_version: int | None = None
+    origin_key: str | None = None
+    common_dir_key: str | None = None
+    lane_root: str | None = None
+    checkout_root: str | None = None
+    lane_subpath: str | None = None
+    legacy_repo_group_key: str | None = None
 
 
 class PullTranscript(BaseModel):
@@ -443,6 +498,23 @@ class PullTranscript(BaseModel):
     project_id: str
     file_path: str
     provider: str
+
+
+class LaneRef(BaseModel):
+    source_lane_id: str = Field(..., max_length=512)
+    source_device_id: str = Field(..., max_length=512)
+    # Required for owners/admins; members may omit it (always their own).
+    uploaded_by_user_id: str | None = Field(default=None, max_length=64)
+
+
+class RepoEvidenceRequest(BaseModel):
+    """ct-5459: refresh lane evidence for history the client already pulled."""
+
+    lanes: list[LaneRef] = Field(..., min_length=1, max_length=1000)
+
+
+class RepoEvidenceResponse(BaseModel):
+    lanes: list[LaneRepoEvidence] = Field(default_factory=list)
 
 
 class PullSummary(BaseModel):
@@ -457,6 +529,9 @@ class SyncPullResponse(BaseModel):
     projects: list[PullProject] = Field(default_factory=list)
     transcripts: list[PullTranscript] = Field(default_factory=list)
     summaries: list[PullSummary] = Field(default_factory=list)
+    # ct-5459: evidence of every (source_lane_id, uploaded_by_device_id,
+    # uploaded_by_user_id) referenced by an entry on this page.
+    lane_evidence: list[LaneRepoEvidence] = Field(default_factory=list)
     has_more: bool = False
     next_cursor: int = 0
     server_sequence: int = 0
@@ -554,6 +629,12 @@ class ProjectShareRequest(BaseModel):
     """Toggle a project's team-read share state (ct-2250)."""
 
     shared: bool
+
+
+class ProjectSharesResponse(BaseModel):
+    """ct-5461: the caller's own team-share rows (server project ids)."""
+
+    project_ids: list[str] = Field(default_factory=list)
 
 
 class ProjectShareResponse(BaseModel):
