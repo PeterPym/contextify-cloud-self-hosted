@@ -69,6 +69,12 @@ from contextify_cloud.services.retirement_coverage import (
 from contextify_cloud.services.retirement_coverage import (
     coverage as retirement_coverage,
 )
+from contextify_cloud.services.sync_rejections import (
+    ACCEPTED_PROVIDERS,
+    UNSUPPORTED_PROVIDER,
+    RejectionTally,
+    unsupported_provider_detail,
+)
 from contextify_cloud.services.sync_status import (
     STALL_WINDOW,
     finalize_effectively_complete_sessions,
@@ -613,6 +619,12 @@ async def sync_push(
             continue
         entries.append(entry)
 
+    # ct-5545: every item this push does not store is tallied by kind and
+    # reason, returned as `rejections[]` and logged once at warning.
+    rejections = RejectionTally()
+    for ie in item_errors:
+        rejections.add(ie.item_kind, ie.error_code, retryable=ie.retryable)
+
     # Resolve tenant schema
     tenant = await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
     tenant_obj = tenant.scalar_one_or_none()
@@ -864,6 +876,9 @@ async def sync_push(
         entries_blocked_policy = max(0, original_entry_count - len(entries))
         if entries_blocked_policy > 0:
             error_codes.add("ENTRY_POLICY_BLOCKED")
+            rejections.add(
+                "entry", "ENTRY_POLICY_BLOCKED", retryable=False, count=entries_blocked_policy
+            )
 
         allowed_entry_ids = {e.id for e in entries}
         allowed_transcript_ids = {t.id for t in request.transcripts}
@@ -1153,6 +1168,109 @@ async def sync_push(
             if meta.project_id in project_id_remap:
                 meta.project_id = project_id_remap[meta.project_id]
 
+    # ct-5545: a transcript whose provider is outside the tenant schema's
+    # CHECK cannot be stored, so its entries would fail their foreign key and,
+    # after the per-row fallback, leave the rest of the batch "retryable" and
+    # the client's cursor blocked forever. Reject them up front instead, as a
+    # permanent per-entry ENTRY_INVALID_FIELD that every released client
+    # (1.8.4+) quarantines, and drop the records that depend on them.
+    rejected_transcript_ids: set[str] = set()
+    unsupported_providers: set[str] = set()
+    kept_transcripts = []
+    for tx in request.transcripts:
+        if tx.provider in ACCEPTED_PROVIDERS:
+            kept_transcripts.append(tx)
+        else:
+            rejected_transcript_ids.add(tx.id)
+            unsupported_providers.add(tx.provider)
+    request.transcripts = kept_transcripts
+    rejected_entries: list[SyncEntry] = []
+    kept_entries: list[SyncEntry] = []
+    for entry in entries:
+        # Only the transcript row is constrained; an entry's own provider
+        # column is free text and stays accepted under a stored transcript.
+        if entry.transcript_id in rejected_transcript_ids:
+            rejected_entries.append(entry)
+        else:
+            kept_entries.append(entry)
+    rejected_entry_ids = {entry.id for entry in rejected_entries}
+    # Entries already rejected by validation never reach `entries`, but their
+    # dependent records would still fail the transcript/entry foreign keys.
+    rejected_entry_ids |= {
+        raw["id"]
+        for raw in raw_entries
+        if isinstance(raw, dict)
+        and isinstance(raw.get("id"), str)
+        and isinstance(raw.get("transcript_id"), str)
+        and raw.get("transcript_id") in rejected_transcript_ids
+    }
+    if unsupported_providers:
+        provider_detail = unsupported_provider_detail(unsupported_providers)
+        rejections.add(
+            "transcript",
+            UNSUPPORTED_PROVIDER,
+            retryable=False,
+            count=len(rejected_transcript_ids),
+            detail=provider_detail,
+        )
+        for entry in rejected_entries:
+            item_errors.append(
+                SyncItemError(
+                    item_kind="entry",
+                    item_id=entry.id,
+                    error_code="ENTRY_INVALID_FIELD",
+                    retryable=False,
+                    detail=provider_detail,
+                    loc=["provider"],
+                )
+            )
+        entries_permanent_failed += len(rejected_entries)
+        rejections.add(
+            "entry",
+            UNSUPPORTED_PROVIDER,
+            retryable=False,
+            count=len(rejected_entries),
+            detail=provider_detail,
+        )
+        entries = kept_entries
+
+        def _depends_on_rejected(entry_id: str | None, transcript_id: str | None) -> bool:
+            return (entry_id is not None and entry_id in rejected_entry_ids) or (
+                transcript_id is not None and transcript_id in rejected_transcript_ids
+            )
+
+        kept_usage = [u for u in request.usage if not _depends_on_rejected(u.entry_id, None)]
+        kept_summaries = [
+            s for s in request.summaries if not _depends_on_rejected(s.entry_id, None)
+        ]
+        kept_invocations = [
+            inv
+            for inv in request.tool_invocations
+            if not _depends_on_rejected(inv.entry_id, inv.transcript_id)
+        ]
+        kept_metadata = [
+            m
+            for m in request.transcript_metadata
+            if not _depends_on_rejected(None, m.transcript_id)
+        ]
+        for kind, before, after in (
+            ("usage", request.usage, kept_usage),
+            ("summary", request.summaries, kept_summaries),
+            ("tool_invocation", request.tool_invocations, kept_invocations),
+            ("transcript_metadata", request.transcript_metadata, kept_metadata),
+        ):
+            rejections.add(
+                kind,  # type: ignore[arg-type]
+                UNSUPPORTED_PROVIDER,
+                retryable=False,
+                count=len(before) - len(after),
+                detail=provider_detail,
+            )
+        request.usage = kept_usage
+        request.summaries = kept_summaries
+        request.tool_invocations = kept_invocations
+        request.transcript_metadata = kept_metadata
+
     transcript_id_remap: dict[str, str] = {}
 
     # Upsert transcripts
@@ -1224,6 +1342,7 @@ async def sync_push(
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"Transcript {tx.id}: {e}")
+            rejections.add("transcript", "TRANSCRIPT_WRITE_FAILED", retryable=True)
 
     if transcript_id_remap:
         for entry in entries:
@@ -1303,6 +1422,7 @@ async def sync_push(
                     # `errors[]` strings.
                     entries_conflicted += 1
                     error_codes.add("ENTRY_CONFLICT")
+                    rejections.add("entry", "ENTRY_CONFLICT", retryable=False)
                     errors.append(
                         f"Entry {entry.id}: conflict - entry exists with different content "
                         f"(existing sha: {existing_map[entry.id][:16]}..., "
@@ -1455,6 +1575,7 @@ async def sync_push(
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"Summary for {summary.entry_id}: {e}")
+            rejections.add("summary", "WRITE_FAILED", retryable=True)
 
     # Upsert usage
     for i, usage in enumerate(request.usage):
@@ -1485,6 +1606,7 @@ async def sync_push(
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"Usage {usage.entry_id}/{usage.request_id}: {e}")
+            rejections.add("usage", "WRITE_FAILED", retryable=True)
 
     # Upsert tool invocations
     for i, inv in enumerate(request.tool_invocations):
@@ -1519,6 +1641,7 @@ async def sync_push(
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"ToolInvocation {inv.id}: {e}")
+            rejections.add("tool_invocation", "WRITE_FAILED", retryable=True)
 
     # Upsert transcript metadata
     for i, meta in enumerate(request.transcript_metadata):
@@ -1556,6 +1679,7 @@ async def sync_push(
         except Exception as e:
             await _rollback_savepoint(db, sp)
             errors.append(f"Metadata {meta.transcript_id}: {e}")
+            rejections.add("transcript_metadata", "WRITE_FAILED", retryable=True)
 
     # ── Data retention enforcement (on-push cleanup) ─────────────────
     # If the tenant has a data retention policy (> 0 days), delete entries
@@ -1800,6 +1924,15 @@ async def sync_push(
     # legacy clients can still see "ENTRY_TOO_LARGE", etc.
     for ie in item_errors:
         error_codes.add(ie.error_code)
+    rejections.add(
+        "entry", "ENTRY_RETRYABLE_DB", retryable=True, count=entries_retriable_failed
+    )
+    entries_rejected = (
+        entries_conflicted
+        + entries_blocked_policy
+        + entries_permanent_failed
+        + entries_retriable_failed
+    )
 
     response = SyncPushResponse(
         accepted=accepted,
@@ -1822,10 +1955,30 @@ async def sync_push(
         needs_attention_count=needs_attention_count,
         error_codes=sorted(error_codes),
         item_errors=item_errors,
+        entries_rejected=entries_rejected,
+        rejections=rejections.categories(),
         server_sequence=server_sequence,
         project_id_remapped=project_id_remap,
         project_canonical_ids=project_canonical_ids,
     )
+    if rejections.needs_warning():
+        # ct-5545: a 200 that stored less than it was sent must be visible at
+        # the default log level. Counts and reason codes only: no content, no
+        # entry ids, no key material.
+        logger.warning(
+            "Sync push partially rejected: tenant=%s user=%s device=%s app_version=%s "
+            "entries_sent=%d entries_accepted=%d entries_rejected=%d completion_state=%s "
+            "rejections=[%s]",
+            auth.tenant_id,
+            auth.user_id,
+            device.id if device else None,
+            request.device.app_version,
+            entries_sent_total,
+            entries_accepted,
+            entries_rejected,
+            completion_state,
+            rejections.log_summary(),
+        )
 
     # Store only resolved idempotency responses for future replay. Retryable
     # blocked/in-progress responses are not stable outcomes; clear the guard row

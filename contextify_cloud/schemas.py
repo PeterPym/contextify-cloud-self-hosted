@@ -331,6 +331,25 @@ class SyncItemError(BaseModel):
     loc: list[str | int] = Field(default_factory=list)
 
 
+class SyncRejectionCategory(BaseModel):
+    """ct-5545: one category of items the server did not store from a push.
+
+    `rejections[]` aggregates every non-stored item by kind and reason so a
+    client (or an operator reading a captured response) sees why a 200 push
+    stored fewer items than it sent. It never names individual items and
+    never carries content; `item_errors[]` remains the per-entry contract.
+    Older clients ignore this field.
+    """
+
+    item_kind: Literal[
+        "entry", "transcript", "summary", "usage", "tool_invocation", "transcript_metadata"
+    ]
+    reason_code: str = Field(max_length=64)
+    count: int
+    retryable: bool
+    detail: str | None = Field(default=None, max_length=500)
+
+
 class SyncPushResponse(BaseModel):
     device_identity_version: int = 1
     device_lifecycle_version: int = 1
@@ -363,6 +382,11 @@ class SyncPushResponse(BaseModel):
     # quarantine every failed entry. `errors[]` above remains the legacy
     # human-readable summary, still capped at 10.
     item_errors: list[SyncItemError] = Field(default_factory=list)
+    # ct-5545: entries this push did not store (conflicted + blocked_policy +
+    # permanent_failed + retriable_failed), and every rejected item grouped by
+    # kind and reason. Additive; older clients ignore both.
+    entries_rejected: int = 0
+    rejections: list[SyncRejectionCategory] = Field(default_factory=list)
     server_sequence: int = 0
     project_id_remapped: dict[str, str] = Field(
         default_factory=dict,
